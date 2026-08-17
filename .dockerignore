@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!entrypoint.sh
+!train_lerobot.py
+!lerobot_v3_compat.py
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!README.md
+.git
+.cursor
+__pycache__/
+*.pyc

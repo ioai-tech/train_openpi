@@ -1,0 +1,3 @@
+# Third-party notices
+
+- [Physical-Intelligence/openpi](https://github.com/Physical-Intelligence/openpi) (`15a9616a00943ada6c20a0f158e3adb39df2ccac`): Apache-2.0
