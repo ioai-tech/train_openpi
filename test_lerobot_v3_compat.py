@@ -9,12 +9,22 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import numpy as np
+
 from lerobot_v3_compat import DatasetLayoutError
+from lerobot_v3_compat import _numeric_feature_names
 from lerobot_v3_compat import assert_v2_local_files
+from lerobot_v3_compat import assert_v21_episode_stats_rows
 from lerobot_v3_compat import convert_v3_to_v2
+from lerobot_v3_compat import episodes_stats_compatible_with_v21
 from lerobot_v3_compat import expected_v2_paths
+from lerobot_v3_compat import generate_episodes_stats_from_parquet
+from lerobot_v3_compat import load_sanitized_stats_json
 from lerobot_v3_compat import load_tasks
+from lerobot_v3_compat import sanitize_episode_stats
+from lerobot_v3_compat import stats_from_episode_record
 from lerobot_v3_compat import tasks_have_text
+from lerobot_v3_compat import unflatten_dict
 from lerobot_v3_compat import v2_chunk
 from lerobot_v3_compat import v2_data_relpath
 from lerobot_v3_compat import v2_video_relpath
@@ -68,7 +78,47 @@ def _packed_v3_info() -> dict:
     }
 
 
-def build_packed_v3(root: Path, *, missing_video: str | None = None) -> Path:
+def _v3_stats_columns(*, include_numeric: bool = True, empty_video: bool = True) -> dict:
+    cols: dict = {}
+    if include_numeric:
+        cols.update(
+            {
+                "stats/action/min": [[0.1, 0.2], [0.5, 0.6], [0.9, 1.0]],
+                "stats/action/max": [[0.3, 0.4], [0.7, 0.8], [1.1, 1.2]],
+                "stats/action/mean": [[0.2, 0.3], [0.6, 0.7], [1.0, 1.1]],
+                "stats/action/std": [[0.1, 0.1], [0.1, 0.1], [0.1, 0.1]],
+                "stats/action/count": [[2], [2], [2]],
+                "stats/action/q01": [[0.1, 0.2], [0.5, 0.6], [0.9, 1.0]],
+                "stats/observation.state/min": [[0.0, 0.0], [0.2, 0.2], [0.4, 0.4]],
+                "stats/observation.state/max": [[0.1, 0.1], [0.3, 0.3], [0.5, 0.5]],
+                "stats/observation.state/mean": [[0.05, 0.05], [0.25, 0.25], [0.45, 0.45]],
+                "stats/observation.state/std": [[0.05, 0.05], [0.05, 0.05], [0.05, 0.05]],
+                "stats/observation.state/count": [[2], [2], [2]],
+            }
+        )
+    if empty_video:
+        cols.update(
+            {
+                f"stats/{CAM_A}/min": [[], [], []],
+                f"stats/{CAM_A}/max": [[], [], []],
+                f"stats/{CAM_A}/mean": [[], [], []],
+                f"stats/{CAM_A}/std": [[], [], []],
+                f"stats/{CAM_A}/count": [[], [], []],
+            }
+        )
+    return cols
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def build_packed_v3(
+    root: Path,
+    *,
+    missing_video: str | None = None,
+    include_stats: bool = True,
+) -> Path:
     """Build a 3-episode packed v3 tree that mirrors the production layout."""
     _write_json(root / "meta" / "info.json", _packed_v3_info())
 
@@ -101,6 +151,8 @@ def build_packed_v3(root: Path, *, missing_video: str | None = None) -> Path:
         f"videos/{CAM_B}/from_timestamp": [0.0, 0.0, 0.0],
         f"videos/{CAM_B}/to_timestamp": [1.0, 1.0, 1.0],
     }
+    if include_stats:
+        episodes.update(_v3_stats_columns())
     _write_table(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet", pa.table(episodes))
 
     _write_table(
@@ -237,3 +289,261 @@ def test_expected_v2_paths_include_videos() -> None:
     assert "data/chunk-001/episode_001000.parquet" in paths
     assert f"videos/chunk-001/{CAM_A}/episode_001000.mp4" in paths
     assert all("action" not in path for path in paths)
+
+
+def test_unflatten_keeps_dotted_feature_names() -> None:
+    nested = unflatten_dict(
+        {
+            "stats/action/count": [2],
+            "stats/observation.state/min": [0.0, 0.1],
+            f"stats/{CAM_A}/count": [],
+        }
+    )
+    assert nested["stats"]["action"]["count"] == [2]
+    assert nested["stats"]["observation.state"]["min"] == [0.0, 0.1]
+    assert nested["stats"][CAM_A]["count"] == []
+
+
+def test_sanitize_drops_empty_image_stats_and_quantiles() -> None:
+    raw = stats_from_episode_record(
+        {
+            "stats/action/min": [0.1, 0.2],
+            "stats/action/max": [0.3, 0.4],
+            "stats/action/mean": [0.2, 0.3],
+            "stats/action/std": [0.1, 0.1],
+            "stats/action/count": [],
+            "stats/action/q01": [0.1, 0.2],
+            f"stats/{CAM_A}/min": [],
+            f"stats/{CAM_A}/max": [],
+            f"stats/{CAM_A}/mean": [],
+            f"stats/{CAM_A}/std": [],
+            f"stats/{CAM_A}/count": [],
+        }
+    )
+    cleaned = sanitize_episode_stats(raw, length=2)
+    assert set(cleaned) == {"action"}
+    assert cleaned["action"]["count"] == [2]
+    assert "q01" not in cleaned["action"]
+    assert CAM_A not in cleaned
+
+
+def test_episodes_stats_compatible_rejects_empty_count() -> None:
+    bad = [{"episode_index": 0, "stats": {CAM_A: {"count": [], "min": []}}}]
+    with pytest.raises(DatasetLayoutError, match=r"count shape must be \(1,\)"):
+        assert_v21_episode_stats_rows(bad)
+    assert not episodes_stats_compatible_with_v21(bad)
+
+    good = [
+        {
+            "episode_index": 0,
+            "stats": {
+                "action": {
+                    "min": [0.0],
+                    "max": [1.0],
+                    "mean": [0.5],
+                    "std": [0.1],
+                    "count": [2],
+                }
+            },
+        }
+    ]
+    assert_v21_episode_stats_rows(good)
+    assert episodes_stats_compatible_with_v21(good)
+    assert np.asarray(good[0]["stats"]["action"]["count"]).shape == (1,)
+
+
+def test_convert_nests_stats_and_drops_empty_camera_count(tmp_path: Path) -> None:
+    src = build_packed_v3(tmp_path / "v3")
+    dest = convert_v3_to_v2(
+        src,
+        tmp_path / "v2",
+        chunks_size=2,
+        extract_video=_fake_extract,
+    )
+    rows = _load_jsonl(dest / "meta" / "episodes_stats.jsonl")
+    assert [row["episode_index"] for row in rows] == [0, 1, 2]
+    first = rows[0]["stats"]
+    assert first["action"]["count"] == [2]
+    assert "min" in first["action"]
+    assert "q01" not in first["action"]
+    assert CAM_A not in first
+    assert CAM_B not in first
+    assert_v21_episode_stats_rows(rows)
+    assert episodes_stats_compatible_with_v21(dest / "meta" / "episodes_stats.jsonl")
+    assert np.asarray(first["action"]["count"]).shape == (1,)
+
+
+def test_convert_without_v3_stats_falls_back_to_parquet(tmp_path: Path) -> None:
+    src = build_packed_v3(tmp_path / "v3", include_stats=False)
+    dest = convert_v3_to_v2(
+        src,
+        tmp_path / "v2",
+        chunks_size=2,
+        extract_video=_fake_extract,
+    )
+    rows = _load_jsonl(dest / "meta" / "episodes_stats.jsonl")
+    assert rows[0]["stats"]["action"]["count"] == [2]
+    assert rows[0]["stats"]["observation.state"]["count"] == [2]
+    assert CAM_A not in rows[0]["stats"]
+    assert_v21_episode_stats_rows(rows)
+
+
+def test_ensure_v21_episodes_stats_rewrites_incompatible_file(tmp_path: Path) -> None:
+    from train_lerobot import ensure_v21_episodes_stats
+
+    dest = tmp_path / "v2"
+    _write_table(
+        dest / "data" / "chunk-000" / "episode_000000.parquet",
+        pa.table({"action": [[0.1, 0.2], [0.3, 0.4]]}),
+    )
+    episodes = dest / "meta" / "episodes.jsonl"
+    episodes.parent.mkdir(parents=True, exist_ok=True)
+    episodes.write_text(json.dumps({"episode_index": 0, "length": 2, "tasks": ["pick"]}) + "\n", encoding="utf-8")
+    bad = dest / "meta" / "episodes_stats.jsonl"
+    bad.write_text(
+        json.dumps({"episode_index": 0, "stats": {CAM_A: {"count": []}}}) + "\n",
+        encoding="utf-8",
+    )
+    ensure_v21_episodes_stats(dest, {"chunks_size": 1000, "total_episodes": 1})
+    rows = _load_jsonl(bad)
+    assert rows[0]["stats"]["action"]["count"] == [2]
+    assert episodes_stats_compatible_with_v21(bad)
+
+
+def test_generate_episodes_stats_overwrites_incompatible_file(tmp_path: Path) -> None:
+    dest = tmp_path / "v2"
+    table = pa.table(
+        {
+            "action": [[0.1, 0.2], [0.3, 0.4]],
+            "observation.state": [[0.0, 0.0], [0.1, 0.1]],
+        }
+    )
+    pq_path = dest / "data" / "chunk-000" / "episode_000000.parquet"
+    _write_table(pq_path, table)
+    bad = dest / "meta" / "episodes_stats.jsonl"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text(
+        json.dumps({"episode_index": 0, "stats": {CAM_A: {"count": [], "min": []}}}) + "\n",
+        encoding="utf-8",
+    )
+    assert not episodes_stats_compatible_with_v21(bad)
+    generate_episodes_stats_from_parquet(dest, [0], chunks_size=1000)
+    assert episodes_stats_compatible_with_v21(bad)
+    rows = _load_jsonl(bad)
+    assert rows[0]["stats"]["action"]["count"] == [2]
+
+
+def _image_channel_stat(value: float) -> list:
+    return [[[value]], [[value]], [[value]]]
+
+
+def _real_v3_global_stats() -> dict:
+    """Subset of the production v3 stats.json: quantiles + valid (3,1,1) cameras."""
+    return {
+        "action": {
+            "count": [315225],
+            "min": [-1.7] * 14,
+            "max": [1.0] * 14,
+            "mean": [-0.9] * 14,
+            "std": [0.2] * 14,
+            "q01": [-1.0] * 14,
+            "q99": [-0.8] * 14,
+        },
+        "observation.state": {
+            "count": [315225],
+            "min": [-1.7] * 14,
+            "max": [1.0] * 14,
+            "mean": [-0.9] * 14,
+            "std": [0.2] * 14,
+            "q01": [-1.0] * 14,
+            "q99": [-0.8] * 14,
+        },
+        "observation.base_move": {
+            "count": [315225],
+            "min": [0.0, 0.0, 0.0],
+            "max": [0.0, 0.0, 0.0],
+            "mean": [0.0, 0.0, 0.0],
+            "std": [0.0, 0.0, 0.0],
+        },
+        CAM_A: {
+            "count": [18549],
+            "min": _image_channel_stat(0.0),
+            "max": _image_channel_stat(1.0),
+            "mean": _image_channel_stat(0.46),
+            "std": _image_channel_stat(0.22),
+        },
+        CAM_B: {
+            "count": [18549],
+            "min": _image_channel_stat(0.0),
+            "max": _image_channel_stat(1.0),
+            "mean": _image_channel_stat(0.47),
+            "std": _image_channel_stat(0.26),
+        },
+    }
+
+
+def test_sanitize_global_stats_drops_quantiles_keeps_images() -> None:
+    cleaned = sanitize_episode_stats(_real_v3_global_stats(), length=0)
+    assert "q01" not in cleaned["action"]
+    assert cleaned["action"]["count"] == [315225]
+    assert cleaned[CAM_A]["count"] == [18549]
+    assert np.asarray(cleaned[CAM_A]["mean"]).shape == (3, 1, 1)
+    assert_v21_episode_stats_rows([{"episode_index": 0, "stats": cleaned}])
+
+
+def test_numeric_feature_names_accepts_float64_fixed_size_list() -> None:
+    table = pa.table(
+        {
+            "action": pa.array([[0.1] * 14, [0.2] * 14], type=pa.list_(pa.float64(), 14)),
+            "episode_index": pa.array([0, 0], type=pa.int64()),
+            "note": pa.array(["a", "b"]),
+        }
+    )
+    names = _numeric_feature_names(table)
+    assert "action" in names
+    assert "episode_index" in names
+    assert "note" not in names
+
+
+def test_convert_official_v21_from_real_v3_stats_layout(tmp_path: Path) -> None:
+    src = build_packed_v3(tmp_path / "v3")
+    info = json.loads((src / "meta" / "info.json").read_text(encoding="utf-8"))
+    info["features"]["action"]["dtype"] = "float64"
+    info["features"]["action"]["fps"] = 30
+    info["features"]["observation.base_move"] = {
+        "dtype": "float64",
+        "shape": [3],
+        "names": ["x", "y", "theta"],
+        "fps": 30,
+    }
+    _write_json(src / "meta" / "info.json", info)
+    _write_json(src / "meta" / "stats.json", _real_v3_global_stats())
+
+    dest = convert_v3_to_v2(
+        src,
+        tmp_path / "v2",
+        chunks_size=2,
+        extract_video=_fake_extract,
+    )
+
+    v2_info = json.loads((dest / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert v2_info["codebase_version"] == "v2.1"
+    assert "fps" not in v2_info["features"]["action"]
+    assert "fps" not in v2_info["features"]["observation.base_move"]
+    assert v2_info["features"][CAM_A]["dtype"] == "video"
+
+    global_stats = json.loads((dest / "meta" / "stats.json").read_text(encoding="utf-8"))
+    assert "q01" not in global_stats["action"]
+    assert set(global_stats[CAM_A]) == {"min", "max", "mean", "std", "count"}
+    assert np.asarray(global_stats[CAM_A]["min"]).shape == (3, 1, 1)
+    assert load_sanitized_stats_json(dest / "meta" / "stats.json") == global_stats
+
+    rows = _load_jsonl(dest / "meta" / "episodes_stats.jsonl")
+    first = rows[0]["stats"]
+    assert first["action"]["count"] == [2]
+    assert "q01" not in first["action"]
+    assert first[CAM_A]["count"] == [2]
+    assert np.asarray(first[CAM_A]["mean"]).shape == (3, 1, 1)
+    assert first[CAM_B]["count"] == [2]
+    assert "observation.base_move" in first
+    assert_v21_episode_stats_rows(rows)

@@ -34,8 +34,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import numpy as np
 
 from lerobot_v3_compat import convert_v3_to_v2
+from lerobot_v3_compat import episodes_stats_compatible_with_v21
+from lerobot_v3_compat import generate_episodes_stats_from_parquet
 from lerobot_v3_compat import tasks_have_text
-from lerobot_v3_compat import v2_data_relpath
 
 DATASET_DIR = pathlib.Path("/data/input")
 OUTPUT_DIR = pathlib.Path("/data/output")
@@ -111,62 +112,6 @@ def setup_dataset_link(dataset_dir: pathlib.Path) -> str:
     return repo_id
 
 
-def _generate_episodes_stats(
-    dataset_dir: pathlib.Path,
-    episode_indices: list[int],
-    chunks_size: int = 1000,
-):
-    """Generate episodes_stats.jsonl from parquet data (required by lerobot 0.1.x)."""
-    import pyarrow.parquet as pq
-
-    meta_dir = dataset_dir / "meta"
-    meta_dir.mkdir(parents=True, exist_ok=True)
-
-    float_features = None
-    with open(meta_dir / "episodes_stats.jsonl", "w") as f:
-        for ep_idx in episode_indices:
-            pq_file = dataset_dir / v2_data_relpath(ep_idx, chunks_size)
-            if not pq_file.exists():
-                f.write(json.dumps({"episode_index": ep_idx, "stats": {}}) + "\n")
-                continue
-
-            table = pq.read_table(pq_file)
-            if float_features is None:
-                float_features = [
-                    col for col in table.column_names
-                    if table.schema.field(col).type in (
-                        __import__("pyarrow").float32(),
-                        __import__("pyarrow").float64(),
-                        __import__("pyarrow").list_(__import__("pyarrow").float32()),
-                        __import__("pyarrow").list_(__import__("pyarrow").float64()),
-                    )
-                ]
-
-            ep_stats: dict = {}
-            for col_name in float_features:
-                col = table.column(col_name)
-                try:
-                    arr = np.array([
-                        row.as_py() if hasattr(row, "as_py") else row
-                        for row in col
-                    ], dtype=np.float32)
-                    if arr.ndim == 1:
-                        arr = arr.reshape(-1, 1)
-                    ep_stats[col_name] = {
-                        "min": arr.min(axis=0).tolist(),
-                        "max": arr.max(axis=0).tolist(),
-                        "mean": arr.mean(axis=0).tolist(),
-                        "std": arr.std(axis=0).tolist(),
-                        "count": [len(arr)],
-                    }
-                except (ValueError, TypeError):
-                    continue
-
-            f.write(json.dumps({"episode_index": ep_idx, "stats": ep_stats}) + "\n")
-
-    logger.info(f"Generated episodes_stats.jsonl for {len(episode_indices)} episodes")
-
-
 def _collect_episode_indices(dataset_dir: pathlib.Path, info: dict) -> list[int]:
     """Collect episode indices from metadata/files with safe fallbacks."""
     meta_dir = dataset_dir / "meta"
@@ -206,10 +151,10 @@ def _collect_episode_indices(dataset_dir: pathlib.Path, info: dict) -> list[int]
 
 
 def ensure_v21_episodes_stats(dataset_dir: pathlib.Path, info: dict) -> None:
-    """Ensure `meta/episodes_stats.jsonl` exists for LeRobot v2.1 datasets."""
+    """Ensure `meta/episodes_stats.jsonl` is readable by LeRobot 0.3."""
     meta_dir = dataset_dir / "meta"
     episodes_stats = meta_dir / "episodes_stats.jsonl"
-    if episodes_stats.exists():
+    if episodes_stats_compatible_with_v21(episodes_stats):
         return
 
     episode_indices = _collect_episode_indices(dataset_dir, info)
@@ -217,8 +162,9 @@ def ensure_v21_episodes_stats(dataset_dir: pathlib.Path, info: dict) -> None:
         logger.warning("Unable to infer episode indices, skipping episodes_stats generation.")
         return
 
+    reason = "not found" if not episodes_stats.exists() else "incompatible with LeRobot 0.3"
     logger.info(
-        "episodes_stats.jsonl not found for v2 dataset, generating from parquet "
+        f"episodes_stats.jsonl {reason} for v2 dataset, generating from parquet "
         f"(episodes={len(episode_indices)}) ..."
     )
     chunks_size = info.get("chunks_size", 1000)
@@ -226,7 +172,9 @@ def ensure_v21_episodes_stats(dataset_dir: pathlib.Path, info: dict) -> None:
         chunks_size = int(chunks_size)
     except (TypeError, ValueError):
         chunks_size = 1000
-    _generate_episodes_stats(dataset_dir, episode_indices, chunks_size=max(1, chunks_size))
+    generate_episodes_stats_from_parquet(
+        dataset_dir, episode_indices, chunks_size=max(1, chunks_size)
+    )
 
 
 def _replace_list_feature_type(obj):

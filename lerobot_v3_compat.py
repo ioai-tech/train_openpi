@@ -18,6 +18,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 logger = logging.getLogger("lerobot_v3_compat")
@@ -41,6 +43,9 @@ TASK_DESCRIPTION_COLUMNS = (
     "task_id",
     "name",
 )
+
+IMAGE_STAT_SHAPE = (3, 1, 1)
+LEGACY_STAT_KEYS = ("min", "max", "mean", "std", "count")
 
 ExtractVideoFn = Callable[[Path, Path, float, float], None]
 
@@ -232,6 +237,339 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             fh.write(json.dumps(_to_serializable(row), ensure_ascii=False) + "\n")
 
 
+def unflatten_dict(flat: dict[str, Any], sep: str = "/") -> dict[str, Any]:
+    """Rebuild a nested dict from ``a/b/c`` keys. Dots in feature names are kept."""
+    nested: dict[str, Any] = {}
+    for key, value in flat.items():
+        parts = str(key).split(sep)
+        cursor = nested
+        for part in parts[:-1]:
+            nxt = cursor.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cursor[part] = nxt
+            cursor = nxt
+        cursor[parts[-1]] = value
+    return nested
+
+
+def _is_empty_stat(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple)):
+        return len(value) == 0
+    size = getattr(value, "size", None)
+    if size is not None:
+        return int(size) == 0
+    return False
+
+
+def _shape_of(value: Any) -> tuple[int, ...] | None:
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(int(dim) for dim in shape)
+    if not isinstance(value, (list, tuple)):
+        return None
+    dims: list[int] = []
+    cursor: Any = value
+    while isinstance(cursor, (list, tuple)):
+        dims.append(len(cursor))
+        if not cursor:
+            break
+        cursor = cursor[0]
+    return tuple(dims)
+
+
+def _is_visual_feature(name: str) -> bool:
+    lower = name.lower()
+    return "image" in lower or "video" in lower
+
+
+def _as_count_list(value: Any, length: int) -> list[int] | None:
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            try:
+                return [int(value[0])]
+            except (TypeError, ValueError):
+                pass
+        if length > 0:
+            return [int(length)]
+        return None
+    if hasattr(value, "tolist") and not isinstance(value, (bytes, str)):
+        return _as_count_list(value.tolist(), length)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [int(value)]
+    if length > 0:
+        return [int(length)]
+    return None
+
+
+def stats_from_episode_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Unflatten v3 ``stats/feature/metric`` columns, or accept a nested ``stats`` dict."""
+    stats_flat = {key: record[key] for key in record if str(key).startswith("stats/")}
+    if stats_flat:
+        nested = unflatten_dict(stats_flat).get("stats")
+        return nested if isinstance(nested, dict) else {}
+
+    raw = record.get("stats")
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    first = next(iter(raw.values()), None)
+    if isinstance(first, dict):
+        return raw
+    return unflatten_dict(raw)
+
+
+def sanitize_episode_stats(raw_stats: dict[str, Any], length: int) -> dict[str, Any]:
+    """Keep only official v2.1 / LeRobot 0.3 ``min/max/mean/std/count`` feature stats."""
+    cleaned: dict[str, Any] = {}
+    if not isinstance(raw_stats, dict):
+        return cleaned
+    for feat, feat_stats in raw_stats.items():
+        if not isinstance(feat_stats, dict):
+            continue
+        min_v = feat_stats.get("min")
+        max_v = feat_stats.get("max")
+        mean_v = feat_stats.get("mean")
+        std_v = feat_stats.get("std")
+        if any(_is_empty_stat(item) for item in (min_v, max_v, mean_v, std_v)):
+            continue
+        count = _as_count_list(feat_stats.get("count"), length)
+        if count is None:
+            continue
+        feat_name = str(feat)
+        if _is_visual_feature(feat_name):
+            if any(_shape_of(item) != IMAGE_STAT_SHAPE for item in (min_v, max_v, mean_v, std_v)):
+                continue
+        cleaned[feat_name] = {
+            "min": _to_serializable(min_v),
+            "max": _to_serializable(max_v),
+            "mean": _to_serializable(mean_v),
+            "std": _to_serializable(std_v),
+            "count": count,
+        }
+    return cleaned
+
+
+def load_sanitized_stats_json(path: Path) -> dict[str, Any]:
+    """Load v3 ``meta/stats.json`` and keep only LeRobot 0.3-safe keys."""
+    if not path.is_file():
+        return {}
+    with path.open(encoding="utf-8") as fh:
+        raw = json.load(fh)
+    if not isinstance(raw, dict):
+        return {}
+    return sanitize_episode_stats(raw, length=0)
+
+
+def write_v21_stats_json(path: Path, stats: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(_to_serializable(stats), fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+
+def _with_episode_count(feat_stats: dict[str, Any], length: int) -> dict[str, Any]:
+    count = [int(length)] if length > 0 else list(feat_stats.get("count") or [])
+    return {
+        "min": feat_stats["min"],
+        "max": feat_stats["max"],
+        "mean": feat_stats["mean"],
+        "std": feat_stats["std"],
+        "count": count,
+    }
+
+
+def complete_episode_stats(
+    stats: dict[str, Any],
+    *,
+    length: int,
+    parquet_stats: dict[str, Any] | None = None,
+    global_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fill missing features from parquet, then official global ``stats.json``.
+
+    Per-episode image stats are often empty placeholders in v3; global stats
+    already store the LeRobot (3, 1, 1) image layout. Reusing them per episode
+    matches ``backward_compatible_episodes_stats`` in LeRobot 0.3.
+    """
+    completed = dict(stats)
+    for source in (parquet_stats, global_stats):
+        if not source:
+            continue
+        for feat, feat_stats in source.items():
+            if feat in completed or not isinstance(feat_stats, dict):
+                continue
+            if any(key not in feat_stats for key in LEGACY_STAT_KEYS):
+                continue
+            completed[feat] = (
+                dict(feat_stats)
+                if source is parquet_stats
+                else _with_episode_count(feat_stats, length)
+            )
+    return completed
+
+
+def _is_numeric_arrow_type(typ: pa.DataType) -> bool:
+    if pa.types.is_floating(typ) or pa.types.is_integer(typ) or pa.types.is_decimal(typ):
+        return True
+    if pa.types.is_list(typ) or pa.types.is_large_list(typ) or pa.types.is_fixed_size_list(typ):
+        return _is_numeric_arrow_type(typ.value_type)
+    return False
+
+
+def _numeric_feature_names(table: pa.Table) -> list[str]:
+    names: list[str] = []
+    for col in table.column_names:
+        if _is_visual_feature(col):
+            continue
+        if _is_numeric_arrow_type(table.schema.field(col).type):
+            names.append(col)
+    return names
+
+
+def episode_stats_from_parquet(
+    dataset_dir: Path,
+    episode_index: int,
+    chunks_size: int = V2_CHUNKS_SIZE,
+    *,
+    float_features: list[str] | None = None,
+) -> dict[str, Any]:
+    """Compute per-episode min/max/mean/std/count from a v2.1 parquet file."""
+    pq_file = Path(dataset_dir) / v2_data_relpath(episode_index, chunks_size)
+    if not pq_file.is_file():
+        return {}
+    table = pq.read_table(pq_file)
+    if float_features is None:
+        float_features = _numeric_feature_names(table)
+    ep_stats: dict[str, Any] = {}
+    for col_name in float_features:
+        if col_name not in table.column_names:
+            continue
+        col = table.column(col_name)
+        try:
+            arr = np.array(
+                [row.as_py() if hasattr(row, "as_py") else row for row in col],
+                dtype=np.float32,
+            )
+            if arr.size == 0:
+                continue
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            ep_stats[col_name] = {
+                "min": arr.min(axis=0).tolist(),
+                "max": arr.max(axis=0).tolist(),
+                "mean": arr.mean(axis=0).tolist(),
+                "std": arr.std(axis=0).tolist(),
+                "count": [int(len(arr))],
+            }
+        except (ValueError, TypeError):
+            continue
+    return ep_stats
+
+
+def generate_episodes_stats_from_parquet(
+    dataset_dir: Path,
+    episode_indices: Iterable[int],
+    chunks_size: int = V2_CHUNKS_SIZE,
+) -> list[dict[str, Any]]:
+    """Rewrite ``meta/episodes_stats.jsonl`` from per-episode parquet files."""
+    indices = [int(idx) for idx in episode_indices]
+    rows: list[dict[str, Any]] = []
+    numeric_features: list[str] | None = None
+    root = Path(dataset_dir)
+    global_stats = load_sanitized_stats_json(root / "meta" / "stats.json")
+    for ep_idx in indices:
+        pq_file = root / v2_data_relpath(ep_idx, chunks_size)
+        length = 0
+        if pq_file.is_file():
+            table = pq.read_table(pq_file)
+            length = int(table.num_rows)
+            if numeric_features is None:
+                numeric_features = _numeric_feature_names(table)
+        parquet_stats = episode_stats_from_parquet(
+            root, ep_idx, chunks_size, float_features=numeric_features
+        )
+        stats = complete_episode_stats(
+            {},
+            length=length,
+            parquet_stats=parquet_stats,
+            global_stats=global_stats,
+        )
+        rows.append({"episode_index": ep_idx, "stats": stats})
+    _write_jsonl(root / "meta" / "episodes_stats.jsonl", rows)
+    logger.info("Generated episodes_stats.jsonl for %s episodes", len(indices))
+    return rows
+
+
+def load_episodes_stats_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def assert_v21_episode_stats_rows(rows: Iterable[dict[str, Any]]) -> None:
+    """Raise if stats would fail LeRobot 0.3 ``aggregate_stats``."""
+    materialized = list(rows)
+    if not materialized:
+        raise DatasetLayoutError("episodes_stats.jsonl is empty")
+    for row in materialized:
+        stats = row.get("stats")
+        ep_idx = row.get("episode_index")
+        if not isinstance(stats, dict):
+            raise DatasetLayoutError(f"episode {ep_idx}: stats must be a dict")
+        for feat, feat_stats in stats.items():
+            if not isinstance(feat_stats, dict):
+                raise DatasetLayoutError(f"episode {ep_idx} feature {feat}: stats must be a dict")
+            for key, value in feat_stats.items():
+                arr = np.asarray(value)
+                if arr.ndim == 0:
+                    raise DatasetLayoutError(
+                        f"episode {ep_idx} feature {feat}: '{key}' must have ndim>=1"
+                    )
+                if key == "count" and arr.shape != (1,):
+                    raise DatasetLayoutError(
+                        f"episode {ep_idx} feature {feat}: count shape must be (1,), got {arr.shape}"
+                    )
+                if "image" in str(feat) and key != "count" and tuple(arr.shape) != IMAGE_STAT_SHAPE:
+                    raise DatasetLayoutError(
+                        f"episode {ep_idx} feature {feat}: '{key}' shape must be (3,1,1), "
+                        f"got {arr.shape}"
+                    )
+
+
+def assert_v21_episodes_stats(dest: Path) -> None:
+    path = Path(dest) / "meta" / "episodes_stats.jsonl"
+    if not path.is_file():
+        raise DatasetLayoutError(f"Missing {path}")
+    assert_v21_episode_stats_rows(load_episodes_stats_rows(path))
+    stats_json = Path(dest) / "meta" / "stats.json"
+    if stats_json.is_file():
+        raw = json.loads(stats_json.read_text(encoding="utf-8"))
+        assert_v21_episode_stats_rows([{"episode_index": "stats.json", "stats": raw}])
+
+
+def episodes_stats_compatible_with_v21(stats_or_path: Path | Iterable[dict[str, Any]]) -> bool:
+    if isinstance(stats_or_path, Path):
+        if not stats_or_path.is_file():
+            return False
+        rows: Iterable[dict[str, Any]] = load_episodes_stats_rows(stats_or_path)
+    else:
+        rows = stats_or_path
+    try:
+        assert_v21_episode_stats_rows(rows)
+    except (DatasetLayoutError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
 def convert_info(
     info: dict[str, Any],
     episode_records: list[dict[str, Any]],
@@ -239,6 +577,17 @@ def convert_info(
     chunks_size: int,
 ) -> dict[str, Any]:
     v2_info = dict(info)
+    features: dict[str, Any] = {}
+    for key, feat in (info.get("features") or {}).items():
+        if isinstance(feat, dict):
+            copied = dict(feat)
+            # Official v2.1 keeps fps only on video features (see GR00T convert_info).
+            if copied.get("dtype") != "video":
+                copied.pop("fps", None)
+            features[key] = copied
+        else:
+            features[key] = feat
+    v2_info["features"] = features
     total_episodes = int(info.get("total_episodes") or len(episode_records))
     v2_info["codebase_version"] = V21
     v2_info["chunks_size"] = chunks_size
@@ -439,28 +788,43 @@ def convert_episodes_metadata(
     dest: Path,
     episode_records: list[dict[str, Any]],
     tasks: list[dict[str, Any]],
+    chunks_size: int = V2_CHUNKS_SIZE,
+    global_stats: dict[str, Any] | None = None,
 ) -> None:
     task_by_index = {int(row["task_index"]): str(row["task"]) for row in tasks}
     episode_rows: list[dict[str, Any]] = []
     stats_rows: list[dict[str, Any]] = []
+    numeric_features: list[str] | None = None
 
     for record in sorted(episode_records, key=lambda rec: _as_int(rec.get("episode_index"), 0)):
         episode_index = _as_int(record["episode_index"])
         length = record.get("length")
         if length is None and record.get("dataset_from_index") is not None:
             length = _as_int(record["dataset_to_index"]) - _as_int(record["dataset_from_index"])
+        length_i = _as_int(length, 0)
         episode_rows.append(
             {
                 "episode_index": episode_index,
-                "length": _as_int(length, 0),
+                "length": length_i,
                 "tasks": _normalize_tasks_list(record, task_by_index),
             }
         )
 
-        stats_flat = {key: record[key] for key in record if str(key).startswith("stats/")}
-        stats: dict[str, Any] = {}
-        for key, value in stats_flat.items():
-            stats[key.split("/", 1)[1]] = value
+        stats = sanitize_episode_stats(stats_from_episode_record(record), length_i)
+        pq_file = dest / v2_data_relpath(episode_index, chunks_size)
+        parquet_stats: dict[str, Any] | None = None
+        if pq_file.is_file():
+            if numeric_features is None:
+                numeric_features = _numeric_feature_names(pq.read_table(pq_file))
+            parquet_stats = episode_stats_from_parquet(
+                dest, episode_index, chunks_size, float_features=numeric_features
+            )
+        stats = complete_episode_stats(
+            stats,
+            length=length_i,
+            parquet_stats=parquet_stats,
+            global_stats=global_stats,
+        )
         stats_rows.append({"episode_index": episode_index, "stats": stats})
 
     _write_jsonl(dest / "meta" / "episodes.jsonl", episode_rows)
@@ -533,9 +897,9 @@ def convert_v3_to_v2(
     with (meta_dest / "info.json").open("w", encoding="utf-8") as fh:
         json.dump(v2_info, fh, indent=2, ensure_ascii=False)
 
-    src_stats = src / "meta" / "stats.json"
-    if src_stats.is_file():
-        shutil.copy2(src_stats, meta_dest / "stats.json")
+    global_stats = load_sanitized_stats_json(src / "meta" / "stats.json")
+    if global_stats:
+        write_v21_stats_json(meta_dest / "stats.json", global_stats)
 
     _write_jsonl(meta_dest / "tasks.jsonl", tasks)
     convert_data(src, dest, episode_records, chunks_size)
@@ -547,10 +911,17 @@ def convert_v3_to_v2(
         chunks_size,
         extract_video=extract_video,
     )
-    convert_episodes_metadata(dest, episode_records, tasks)
+    convert_episodes_metadata(
+        dest,
+        episode_records,
+        tasks,
+        chunks_size=chunks_size,
+        global_stats=global_stats,
+    )
 
     episode_indices = [_as_int(rec["episode_index"]) for rec in episode_records]
     assert_v2_local_files(dest, v2_info, episode_indices, chunks_size=chunks_size)
+    assert_v21_episodes_stats(dest)
 
     logger.info("Converted v3 dataset to v2 layout at %s", dest)
     logger.info(
