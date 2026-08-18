@@ -146,7 +146,9 @@ jobs:
             LEROBOT_VERSION=auto
             BUILD_VERSION=${{ steps.meta.outputs.version }}
             VCS_REF=${{ github.sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:${{ matrix.variant }}
-          cache-to: type=inline
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.variant }}
+            type=registry,ref=${{ env.IMAGE_NAME }}:${{ matrix.variant }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max,ignore-error=true', env.IMAGE_NAME, matrix.variant) || '' }}
           provenance: mode=max
           sbom: true

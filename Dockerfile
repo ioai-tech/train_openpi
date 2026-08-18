@@ -10,6 +10,10 @@
 #
 #  Upstream openpi is cloned at build time (not a git submodule).
 #  Pin OPENPI_GIT_REF to a commit; do not point published images at main.
+#
+#  Layer order: keep volatile ARG/LABEL (BUILD_VERSION, VCS_REF) after the
+#  weight download. Using them earlier busts BuildKit cache and forces
+#  docker pull to re-fetch the multi-GB checkpoint layer.
 # ==========================================================================
 
 ARG CUDA_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu22.04@sha256:4cf7f8137bdeeb099b1f2de126e505aa1f01b6e4471d13faf93727a9bf83d539
@@ -18,20 +22,8 @@ FROM ${CUDA_IMAGE}
 
 ARG OPENPI_GIT_URL=https://github.com/Physical-Intelligence/openpi.git
 ARG OPENPI_GIT_REF=15a9616a00943ada6c20a0f158e3adb39df2ccac
-ARG BUILD_VERSION=dev
-ARG VCS_REF=unknown
 ARG MODEL_TYPE=pi0
 ARG LEROBOT_VERSION=auto
-
-LABEL org.opencontainers.image.title="IOAI OpenPI Trainer" \
-      org.opencontainers.image.description="OpenPI (Pi0 / Pi0.5) training for LeRobot v2/v3 datasets" \
-      org.opencontainers.image.source="https://github.com/ioai-tech/train_openpi" \
-      org.opencontainers.image.documentation="https://github.com/ioai-tech/train_openpi#readme" \
-      org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.version="${BUILD_VERSION}" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      io.ioai.train-openpi.upstream-commit="${OPENPI_GIT_REF}" \
-      io.ioai.train-openpi.model-type="${MODEL_TYPE}"
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -104,3 +96,18 @@ RUN chmod 0755 /app/entrypoint.sh \
 
 VOLUME ["/data/input", "/data/output"]
 ENTRYPOINT ["/app/entrypoint.sh"]
+
+# Volatile metadata only — do not move above the weight RUN.
+ARG BUILD_VERSION=dev
+ARG VCS_REF=unknown
+ARG OPENPI_GIT_REF
+ARG MODEL_TYPE
+LABEL org.opencontainers.image.title="IOAI OpenPI Trainer" \
+      org.opencontainers.image.description="OpenPI (Pi0 / Pi0.5) training for LeRobot v2/v3 datasets" \
+      org.opencontainers.image.source="https://github.com/ioai-tech/train_openpi" \
+      org.opencontainers.image.documentation="https://github.com/ioai-tech/train_openpi#readme" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      io.ioai.train-openpi.upstream-commit="${OPENPI_GIT_REF}" \
+      io.ioai.train-openpi.model-type="${MODEL_TYPE}"
