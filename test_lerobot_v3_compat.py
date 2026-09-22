@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 import numpy as np
 
 from lerobot_v3_compat import DatasetLayoutError
+from lerobot_v3_compat import _link_or_copy_whole_file
 from lerobot_v3_compat import _numeric_feature_names
 from lerobot_v3_compat import assert_v2_local_files
 from lerobot_v3_compat import assert_v21_episode_stats_rows
@@ -239,13 +241,19 @@ def test_convert_packed_v3_writes_v2_chunks(tmp_path: Path) -> None:
     cam_a_ep1 = (dest / "videos" / "chunk-000" / CAM_A / "episode_000001.mp4").read_bytes()
     assert cam_a_ep0 == b"file-000.mp4:0.000:1.000"
     assert cam_a_ep1 == b"file-000.mp4:1.000:2.000"
+    # A whole-file episode is published as a real file, never a symlink: the source
+    # dataset and the cache are separate trees, so no relative link exists and an
+    # absolute one would only work under the mount layout that created it.
     cam_a_ep2 = dest / "videos" / "chunk-001" / CAM_A / "episode_000002.mp4"
-    assert cam_a_ep2.is_symlink()
-    assert cam_a_ep2.resolve().name == "file-001.mp4"
+    assert cam_a_ep2.is_file()
+    assert not cam_a_ep2.is_symlink()
+    assert cam_a_ep2.read_bytes() == (src / "videos" / CAM_A / "chunk-000" / "file-001.mp4").read_bytes()
 
     # cam_b file_index is independent of the single data parquet (always file-000).
-    assert (dest / "videos" / "chunk-000" / CAM_B / "episode_000001.mp4").is_symlink()
-    assert (dest / "videos" / "chunk-000" / CAM_B / "episode_000001.mp4").resolve().name == "file-001.mp4"
+    cam_b_ep1 = dest / "videos" / "chunk-000" / CAM_B / "episode_000001.mp4"
+    assert cam_b_ep1.is_file()
+    assert not cam_b_ep1.is_symlink()
+    assert cam_b_ep1.read_bytes() == (src / "videos" / CAM_B / "chunk-000" / "file-001.mp4").read_bytes()
 
     tasks = [
         json.loads(line)
@@ -690,6 +698,33 @@ def test_camera_view_hides_dropped_camera_and_reuses(tmp_path: Path) -> None:
     reused = make_camera_view(full, view, [CAM_B])
     assert reused == view
     assert make_camera_view(full, tmp_path / "unused", [CAM_A, CAM_B]) == full
+
+
+def test_view_and_cache_links_are_relative(tmp_path: Path) -> None:
+    """Absolute links would record the container's mount path and dangle outside it."""
+    src = build_packed_v3(tmp_path / "v3")
+    full = convert_v3_to_v2(src, tmp_path / "v2", chunks_size=2, extract_video=_fake_extract)
+    view = make_camera_view(full, tmp_path / "view", [CAM_B])
+
+    for tree in (full, view):
+        links = [p for p in tree.rglob("*") if p.is_symlink()]
+        absolute = [str(p) for p in links if os.path.isabs(os.readlink(p))]
+        assert absolute == [], absolute
+        dangling = [str(p) for p in links if not p.resolve().exists()]
+        assert dangling == [], dangling
+    assert (view / "videos").is_dir()
+    assert list((view / "videos").rglob("*.mp4"))
+
+
+def test_whole_file_video_is_published_without_a_symlink(tmp_path: Path) -> None:
+    """A cross-mount symlink cannot be relative, so whole files are linked or copied."""
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"video-bytes" * 8)
+    dest = tmp_path / "dest.mp4"
+    outcome = _link_or_copy_whole_file(src, dest)
+    assert outcome in {"hardlink", "copy"}
+    assert not dest.is_symlink()
+    assert dest.read_bytes() == src.read_bytes()
 
 
 def test_stage_writable_dataset_does_not_touch_readonly_source(tmp_path: Path) -> None:

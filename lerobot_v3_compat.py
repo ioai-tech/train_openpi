@@ -778,9 +778,39 @@ def convert_videos(
                 if unique_owner:
                     if dest_path.exists() or dest_path.is_symlink():
                         dest_path.unlink()
-                    os.symlink(str(src_path.resolve()), str(dest_path))
+                    _link_or_copy_whole_file(src_path, dest_path)
                     continue
                 extract_video(src_path, dest_path, start, end)
+
+
+def _relative_link_target(target: Path, link: Path) -> str:
+    """Relative path from the directory holding ``link`` to ``target``.
+
+    Relative links resolve identically on the host and inside a container as
+    long as the two trees keep their relative layout. An absolute link records
+    the container-side mount path, so it dangles everywhere else and ties the
+    cache to one mount layout.
+    """
+    return os.path.relpath(Path(target).resolve(), Path(link).parent.resolve())
+
+
+def _link_or_copy_whole_file(src_file: Path, dest_file: Path) -> str:
+    """Publish a source video as an episode clip without re-encoding it.
+
+    A hardlink shares the bytes, so the cache stays self-contained without
+    duplicating storage. It fails with ``EXDEV`` across mount points (a source
+    dataset and the cache are usually separate bind mounts), and a read-only
+    source rejects it too, so fall back to a copy. A symlink is not used here:
+    the two trees are mounted at unrelated paths, so no relative target exists
+    and an absolute one would only work under the original mounts.
+    """
+    try:
+        os.link(src_file, dest_file)
+        return "hardlink"
+    except OSError as exc:
+        logger.debug("Hardlinking %s failed (%s); copying instead", dest_file, exc)
+    shutil.copy2(src_file, dest_file)
+    return "copy"
 
 
 def _normalize_tasks_list(record: dict[str, Any], task_by_index: dict[int, str]) -> list[str]:
@@ -960,7 +990,12 @@ def _reset_dir(path: Path) -> None:
 
 
 def _symlink_children(src_dir: Path, dest_dir: Path) -> None:
-    """Symlink each file under ``src_dir`` so replacing one link does not write the source."""
+    """Link each file under ``src_dir`` into ``dest_dir`` with relative targets.
+
+    Replacing one entry in ``dest_dir`` then leaves the source untouched, and
+    because the targets are relative the tree also resolves outside the
+    container that created it.
+    """
     if not src_dir.is_dir():
         return
     for path in sorted(src_dir.rglob("*")):
@@ -971,7 +1006,19 @@ def _symlink_children(src_dir: Path, dest_dir: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.is_symlink() or target.exists():
             target.unlink()
-        os.symlink(path.resolve(), target)
+        os.symlink(_relative_link_target(path, target), target)
+
+
+def _copy_children(src_dir: Path, dest_dir: Path) -> None:
+    """Copy each file under ``src_dir`` into ``dest_dir``."""
+    if not src_dir.is_dir():
+        return
+    for path in sorted(src_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        target = dest_dir / path.relative_to(src_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
 
 
 def _filter_stats(stats: dict[str, Any], drop_keys: set[str]) -> dict[str, Any]:
@@ -979,10 +1026,13 @@ def _filter_stats(stats: dict[str, Any], drop_keys: set[str]) -> dict[str, Any]:
 
 
 def stage_writable_dataset(src: Path, dest: Path) -> Path:
-    """Return ``src`` when it can be edited, otherwise a writable tree of symlinks.
+    """Return ``src`` when it can be edited, otherwise a writable copy to edit.
 
-    Parquet files are linked one by one. A later atomic replace updates the
-    link in ``dest`` and leaves the source dataset untouched.
+    Metadata and frame data are copied, so the staged tree is writable and
+    self-contained. Only ``videos/`` is linked, because video data is large;
+    that link is relative when the source sits inside the same tree as ``dest``
+    and absolute otherwise, in which case the staged tree stays valid only
+    while the source is mounted at the same path.
     """
     src = Path(src)
     meta = src / "meta"
@@ -1009,8 +1059,18 @@ def stage_writable_dataset(src: Path, dest: Path) -> Path:
             copied.chmod(copied.stat().st_mode | (0o700 if copied.is_dir() else 0o600))
     videos = src / "videos"
     if videos.is_dir():
-        os.symlink(videos.resolve(), dest / "videos")
-    _symlink_children(data, dest / "data")
+        link_target = _relative_link_target(videos, dest / "videos")
+        # Climbing several levels means the source sits in a different tree,
+        # which is normally a different mount.
+        if link_target.count("..") > 1:
+            logger.warning(
+                "Staged dataset links videos with %r; that tree is only valid while the source "
+                "dataset is mounted at %s",
+                link_target,
+                videos,
+            )
+        os.symlink(link_target, dest / "videos")
+    _copy_children(data, dest / "data")
     _write_json_stamp(dest / "meta" / ".staged.json", marker)
     return dest
 
@@ -1030,7 +1090,8 @@ def make_camera_view(src: Path, dest: Path, keep_video_keys: Sequence[str]) -> P
         return src
 
     stamp = {
-        "stamp_version": 1,
+        # 2: links are relative, so the view also resolves outside the container.
+        "stamp_version": 2,
         "source": str(src.resolve()),
         "video_keys": selected,
     }
@@ -1044,7 +1105,7 @@ def make_camera_view(src: Path, dest: Path, keep_video_keys: Sequence[str]) -> P
     _symlink_children(src / "data", dest / "data")
     videos = src / "videos"
     if videos.is_dir():
-        os.symlink(videos.resolve(), dest / "videos")
+        os.symlink(_relative_link_target(videos, dest / "videos"), dest / "videos")
 
     meta_src = src / "meta"
     meta_dest = dest / "meta"
@@ -1052,7 +1113,7 @@ def make_camera_view(src: Path, dest: Path, keep_video_keys: Sequence[str]) -> P
     for name in ("tasks.jsonl", "tasks.parquet", "episodes.jsonl"):
         source_file = meta_src / name
         if source_file.is_file() or source_file.is_symlink():
-            os.symlink(source_file.resolve(), meta_dest / name)
+            os.symlink(_relative_link_target(source_file, meta_dest / name), meta_dest / name)
 
     drop_keys = set(available) - set(selected)
     viewed = convert_info(info, [], selected, int(info.get("chunks_size") or V2_CHUNKS_SIZE))

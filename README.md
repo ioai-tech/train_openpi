@@ -138,6 +138,11 @@ directory of symlinks plus a rewritten `meta/info.json`, so LeRobot does not
 decode dropped cameras. Put the cache on a real disk. The converter will not
 write to `/tmp`.
 
+The cache and the camera view are self-contained: links between them are
+relative and resolve outside the container that built them. Episodes that
+cover a whole source video are hardlinked, or copied when the source and the
+cache are separate mounts, so no file points back at the dataset mount.
+
 Read-only dataset mounts stay read-only. A v2 dataset that cannot be edited is
 staged into the cache before metadata fixes. Each run writes
 `<run_name>/<exp_name>.run_manifest.json` with the camera map, prompt, and
