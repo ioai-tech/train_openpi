@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from train_lerobot import GenericLeRobotInputs
+from train_lerobot import enable_line_buffered_stdout
 from train_lerobot import resolve_keep_period
 from train_lerobot import select_parquet_files
 
@@ -52,3 +53,8 @@ def test_keep_period_follows_save_interval_by_default() -> None:
     assert resolve_keep_period(4000, 20000) == 20000
     assert resolve_keep_period(4000, 0) is None
     assert resolve_keep_period(0, None) is None
+
+
+def test_enable_line_buffered_stdout_tolerates_unbuffered_streams() -> None:
+    # pytest replaces sys.stdout with a stream that cannot be reconfigured.
+    enable_line_buffered_stdout()

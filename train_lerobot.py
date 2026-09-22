@@ -701,6 +701,20 @@ def compute_norm_stats(
 # Main
 # ---------------------------------------------------------------------------
 
+def enable_line_buffered_stdout() -> None:
+    """Flush progress lines as they are written.
+
+    Per-step metrics are emitted with ``tqdm.write``, which does not flush.
+    When stdout is a pipe (`docker logs`, a redirected log file) Python
+    block-buffers it, so ``Step N: loss=...`` can stay invisible for thousands
+    of steps. Progress bars are unaffected because they go through logging.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def _cache_dir_for(args, dataset_dir: pathlib.Path, info: dict) -> pathlib.Path:
     if args.convert_dir is not None:
         return pathlib.Path(args.convert_dir)
@@ -797,6 +811,7 @@ def main():
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    enable_line_buffered_stdout()
 
     try:
         prepared = prepare_dataset(args)
