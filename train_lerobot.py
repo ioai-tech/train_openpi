@@ -462,6 +462,19 @@ def select_parquet_files(
     return ordered[:n_files]
 
 
+def _consume_in_order(futures):
+    """Yield future results in submission order.
+
+    ``RunningStats`` is order-sensitive twice over: its mean is a running
+    average, and its quantiles come from a histogram whose grid is anchored on
+    the first batch it sees. Folding results in completion order therefore made
+    the statistics depend on thread timing, so two runs over identical data
+    could bake slightly different norm stats into their checkpoints.
+    """
+    for future in futures:
+        yield future.result()
+
+
 def _compute_norm_stats_fast(
     config,
     dataset_dir: pathlib.Path,
@@ -543,12 +556,11 @@ def _compute_norm_stats_fast(
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
             future_list = [pool.submit(_read_file, p) for p in files_to_process]
             pbar = tqdm(
-                concurrent.futures.as_completed(future_list),
+                _consume_in_order(future_list),
                 total=len(future_list),
                 desc="norm-stats (fast)",
             )
-            for fut in pbar:
-                state_arr, action_arr = fut.result()
+            for state_arr, action_arr in pbar:
                 if state_arr is None:
                     continue
                 state_stats.update(state_arr)

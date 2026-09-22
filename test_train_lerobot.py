@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from train_lerobot import GenericLeRobotInputs
+from train_lerobot import _consume_in_order
 from train_lerobot import enable_line_buffered_stdout
 from train_lerobot import resolve_keep_period
 from train_lerobot import select_parquet_files
@@ -58,3 +59,18 @@ def test_keep_period_follows_save_interval_by_default() -> None:
 def test_enable_line_buffered_stdout_tolerates_unbuffered_streams() -> None:
     # pytest replaces sys.stdout with a stream that cannot be reconfigured.
     enable_line_buffered_stdout()
+
+
+def test_fold_results_in_submission_order() -> None:
+    """Norm stats are order-sensitive, so thread timing must not reorder them."""
+    import concurrent.futures
+    import time
+
+    def finish_later(value: int, delay: float) -> int:
+        time.sleep(delay)
+        return value
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        # Earliest submissions finish last, so completion order is reversed.
+        futures = [pool.submit(finish_later, value, 0.02 * (4 - value)) for value in range(5)]
+        assert list(_consume_in_order(futures)) == [0, 1, 2, 3, 4]
