@@ -76,8 +76,17 @@ docker run --rm --gpus all --ipc=host \
 | `--ema_decay` | off | e.g. `0.99` |
 | `--action_horizon` | `50` | |
 | `--num_workers` | `8` | |
+| `--dataset_dir` | `/data/input` | or `$OPENPI_DATASET_DIR` |
+| `--output_dir` | `/data/output` | or `$OPENPI_OUTPUT_DIR` |
+| `--run_name` | `docker_train` | checkpoint parent directory |
+| `--exp_name` | `train` | |
+| `--convert_dir` | under `--output_dir` | v3→v2 cache; do not use a small tmpfs |
+| `--cameras` | all image keys | comma-separated keys to keep |
+| `--drop_cameras` | | key or substring, e.g. `front` |
+| `--camera_map` | role-based | `base=key,left_wrist=key,right_wrist=key` |
+| `--delta_joint_actions` | off | joint deltas, last dim (gripper) stays absolute |
 | `--norm_stats_workers` | `min(cpu, 64)` | |
-| `--norm_stats_max_frames` | `10000` | |
+| `--norm_stats_max_frames` | `0` | `0` reads every state/action row |
 
 ## LoRA
 
@@ -85,6 +94,56 @@ docker run --rm --gpus all --ipc=host \
 VRAM and runs on a 24GB GPU (e.g. RTX 4090). Full fine-tuning needs >70GB.
 
 Single-GPU default is on. Disable with `--lora false`.
+
+## Cameras
+
+Pi0 / Pi0.5 always have three slots: `base_0_rgb`, `left_wrist_0_rgb`,
+`right_wrist_0_rgb`. Keys are matched by name (`front` / `base` / `high` /
+`exterior` → base, `wrist` → left wrist, `right` + `wrist` → right wrist).
+Remaining keys fill empty slots. A missing slot is a zero image with
+`image_mask=false`.
+
+At most three cameras are used. Pass `--cameras` or `--drop_cameras` when a
+dataset has more. Example, three cameras then the same cache without the
+front camera:
+
+```bash
+docker run --rm --gpus all --shm-size=16g \
+  -v /path/to/lerobot_dataset:/data/input:ro \
+  -v /path/to/output:/data/output \
+  -v /path/to/cache:/data/cache \
+  ioaitech/train_openpi:pi05-cuda126 \
+  --run_name pi05_my_task_3cam \
+  --steps 30000 \
+  --save_interval 5000 \
+  --convert_dir /data/cache/my_task
+
+docker run --rm --gpus all --shm-size=16g \
+  -v /path/to/lerobot_dataset:/data/input:ro \
+  -v /path/to/output:/data/output \
+  -v /path/to/cache:/data/cache \
+  ioaitech/train_openpi:pi05-cuda126 \
+  --run_name pi05_my_task_no_front \
+  --drop_cameras front \
+  --steps 30000 \
+  --save_interval 5000 \
+  --convert_dir /data/cache/my_task
+```
+
+v3 datasets are converted once into `--convert_dir`. A later run with the same
+directory and the same videos reuses that tree. A camera subset is a second
+directory of symlinks plus a rewritten `meta/info.json`, so LeRobot does not
+decode dropped cameras. Put the cache on a real disk. The converter will not
+write to `/tmp`.
+
+Read-only dataset mounts stay read-only. A v2 dataset that cannot be edited is
+staged into the cache before metadata fixes. Each run writes
+`<run_name>/<exp_name>.run_manifest.json` with the camera map, prompt, and
+whether actions were left absolute.
+
+The image's entrypoint uses the host `libcuda` when the host driver is newer
+than the image's CUDA compat library. That is the usual case for newer
+datacenter and workstation GPUs, including compute capability 12.0.
 
 ## License
 

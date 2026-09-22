@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pyarrow as pa
@@ -15,13 +17,18 @@ from lerobot_v3_compat import DatasetLayoutError
 from lerobot_v3_compat import _numeric_feature_names
 from lerobot_v3_compat import assert_v2_local_files
 from lerobot_v3_compat import assert_v21_episode_stats_rows
+from lerobot_v3_compat import assign_camera_slots
 from lerobot_v3_compat import convert_v3_to_v2
+from lerobot_v3_compat import extract_video_segment
 from lerobot_v3_compat import episodes_stats_compatible_with_v21
 from lerobot_v3_compat import expected_v2_paths
 from lerobot_v3_compat import generate_episodes_stats_from_parquet
 from lerobot_v3_compat import load_sanitized_stats_json
 from lerobot_v3_compat import load_tasks
+from lerobot_v3_compat import make_camera_view
 from lerobot_v3_compat import sanitize_episode_stats
+from lerobot_v3_compat import select_image_keys
+from lerobot_v3_compat import stage_writable_dataset
 from lerobot_v3_compat import stats_from_episode_record
 from lerobot_v3_compat import tasks_have_text
 from lerobot_v3_compat import unflatten_dict
@@ -193,6 +200,8 @@ def test_load_tasks_index_level_column(tmp_path: Path) -> None:
     )
     tasks = load_tasks(tmp_path)
     assert tasks == [{"task_index": 3, "task": "open the drawer"}]
+    assert tasks_have_text(tmp_path)
+    assert not tasks_have_text(tmp_path / "empty")
 
 
 def test_convert_packed_v3_writes_v2_chunks(tmp_path: Path) -> None:
@@ -547,3 +556,160 @@ def test_convert_official_v21_from_real_v3_stats_layout(tmp_path: Path) -> None:
     assert first[CAM_B]["count"] == [2]
     assert "observation.base_move" in first
     assert_v21_episode_stats_rows(rows)
+
+
+FRONT = "observation.images.front"
+TOP = "observation.images.top"
+WRIST = "observation.images.wrist"
+
+
+def test_extract_video_segment_starts_at_zero(tmp_path: Path) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg is not installed")
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=30",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "2",
+            str(src),
+        ],
+        check=True,
+    )
+    dst = tmp_path / "cut.mp4"
+    extract_video_segment(src, dst, 0.4, 1.3)
+    start = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=start_time",
+            "-of",
+            "default=nw=1:nk=1",
+            str(dst),
+        ],
+        text=True,
+    )
+    first = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "csv=p=0",
+            str(dst),
+        ],
+        text=True,
+    ).splitlines()[0]
+    assert float(start.strip()) < 1e-3
+    assert abs(float(first.split(",")[0])) < 1e-3
+
+
+def test_camera_slots_follow_role_names() -> None:
+    three = [FRONT, TOP, WRIST]
+    slots = assign_camera_slots(three)
+    assert slots == {
+        "base_0_rgb": FRONT,
+        "left_wrist_0_rgb": WRIST,
+        "right_wrist_0_rgb": TOP,
+    }
+    kept = select_image_keys(three, drop_cameras=["front"])
+    assert kept == [TOP, WRIST]
+    two = assign_camera_slots(kept)
+    assert two == {"base_0_rgb": TOP, "left_wrist_0_rgb": WRIST}
+    assert "right_wrist_0_rgb" not in two
+
+
+def test_convert_reuses_completed_tree_and_can_limit_cameras(tmp_path: Path) -> None:
+    src = build_packed_v3(tmp_path / "v3")
+    calls = {"n": 0}
+
+    def _counting(src_path: Path, dst: Path, start: float, end: float) -> None:
+        calls["n"] += 1
+        _fake_extract(src_path, dst, start, end)
+
+    dest = convert_v3_to_v2(src, tmp_path / "v2", chunks_size=2, extract_video=_counting)
+    assert calls["n"] > 0
+    seen = calls["n"]
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("cached conversion must not extract video again")
+
+    again = convert_v3_to_v2(src, dest, chunks_size=2, extract_video=_forbidden)
+    assert again == dest
+    assert calls["n"] == seen
+
+    with pytest.raises(ValueError, match="/tmp"):
+        convert_v3_to_v2(src)
+
+    limited = convert_v3_to_v2(
+        src,
+        tmp_path / "wrist-only",
+        chunks_size=2,
+        extract_video=_fake_extract,
+        video_keys=[CAM_B],
+    )
+    info = json.loads((limited / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert CAM_B in info["features"]
+    assert CAM_A not in info["features"]
+    assert not any(path.name.startswith("episode_") and CAM_A in str(path) for path in (limited / "videos").rglob("*"))
+
+
+def test_camera_view_hides_dropped_camera_and_reuses(tmp_path: Path) -> None:
+    src = build_packed_v3(tmp_path / "v3")
+    full = convert_v3_to_v2(src, tmp_path / "v2", chunks_size=2, extract_video=_fake_extract)
+    view = make_camera_view(full, tmp_path / "view", [CAM_B])
+    info = json.loads((view / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert CAM_A not in info["features"]
+    assert CAM_B in info["features"]
+    episode = view / "data" / "chunk-000" / "episode_000000.parquet"
+    assert episode.is_file()
+    assert episode.is_symlink()
+    reused = make_camera_view(full, view, [CAM_B])
+    assert reused == view
+    assert make_camera_view(full, tmp_path / "unused", [CAM_A, CAM_B]) == full
+
+
+def test_stage_writable_dataset_does_not_touch_readonly_source(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    meta = src / "meta"
+    data = src / "data" / "chunk-000"
+    data.mkdir(parents=True)
+    (meta).mkdir(parents=True)
+    (meta / "info.json").write_text("{}\n", encoding="utf-8")
+    _write_table(data / "episode_000000.parquet", pa.table({"action": [[0.0, 1.0]]}))
+    before = (data / "episode_000000.parquet").read_bytes()
+    for path in (src, meta, src / "data", data):
+        path.chmod(0o555)
+    try:
+        staged = stage_writable_dataset(src, tmp_path / "work")
+        assert staged != src
+        (staged / "meta" / "episodes_stats.jsonl").write_text("{}\n", encoding="utf-8")
+        assert not (meta / "episodes_stats.jsonl").exists()
+        assert (data / "episode_000000.parquet").read_bytes() == before
+        assert stage_writable_dataset(src, tmp_path / "work") == staged
+    finally:
+        for path in (data, src / "data", meta, src):
+            path.chmod(0o755)

@@ -10,10 +10,12 @@ No modifications to OpenPI core code are required.
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import os
 import pathlib
+import random
 import shutil
 import sys
 
@@ -33,13 +35,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import numpy as np
 
+from lerobot_v3_compat import assign_camera_slots
+from lerobot_v3_compat import camera_view_dir
+from lerobot_v3_compat import conversion_stamp
 from lerobot_v3_compat import convert_v3_to_v2
 from lerobot_v3_compat import episodes_stats_compatible_with_v21
 from lerobot_v3_compat import generate_episodes_stats_from_parquet
+from lerobot_v3_compat import load_tasks
+from lerobot_v3_compat import make_camera_view
+from lerobot_v3_compat import parse_camera_map
+from lerobot_v3_compat import select_image_keys
+from lerobot_v3_compat import stage_writable_dataset
 from lerobot_v3_compat import tasks_have_text
+from lerobot_v3_compat import video_keys_from_info
 
-DATASET_DIR = pathlib.Path("/data/input")
-OUTPUT_DIR = pathlib.Path("/data/output")
+DEFAULT_DATASET_DIR = pathlib.Path(os.environ.get("OPENPI_DATASET_DIR", "/data/input"))
+DEFAULT_OUTPUT_DIR = pathlib.Path(os.environ.get("OPENPI_OUTPUT_DIR", "/data/output"))
 
 logger = logging.getLogger("train_lerobot")
 
@@ -48,8 +59,34 @@ logger = logging.getLogger("train_lerobot")
 # CLI
 # ---------------------------------------------------------------------------
 
+def _csv_list(value: str | None) -> list[str] | None:
+    if value is None or not value.strip():
+        return None
+    items = [part.strip() for part in value.split(",") if part.strip()]
+    return items or None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OpenPI on a mounted LeRobot dataset")
+    parser.add_argument("--dataset_dir", type=pathlib.Path, default=DEFAULT_DATASET_DIR,
+                        help="LeRobot dataset root (default: $OPENPI_DATASET_DIR or /data/input)")
+    parser.add_argument("--output_dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR,
+                        help="Checkpoint root (default: $OPENPI_OUTPUT_DIR or /data/output)")
+    parser.add_argument("--run_name", type=str, default="docker_train",
+                        help="TrainConfig name. Checkpoints land in <output_dir>/<run_name>/<exp_name>")
+    parser.add_argument("--exp_name", type=str, default="train")
+    parser.add_argument("--convert_dir", type=pathlib.Path, default=None,
+                        help="Writable v3->v2 cache. Default: <output_dir>/.v21_cache/<fingerprint>. "
+                             "Do not point this at a small tmpfs.")
+    parser.add_argument("--cameras", type=str, default=None,
+                        help="Comma-separated image keys to keep, e.g. observation.images.top,observation.images.wrist")
+    parser.add_argument("--drop_cameras", type=str, default=None,
+                        help="Comma-separated image keys or substrings to drop, e.g. front")
+    parser.add_argument("--camera_map", type=str, default=None,
+                        help="Explicit slots: base=key,left_wrist=key,right_wrist=key")
+    parser.add_argument("--delta_joint_actions", action="store_true",
+                        help="Train joint dims as deltas and keep the last dim (gripper) absolute. "
+                             "Default keeps the dataset action values unchanged.")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--gpus", type=str, default="all",
@@ -72,10 +109,10 @@ def parse_args():
     parser.add_argument("--norm_stats_workers", type=int, default=_default_workers,
                         help=f"Parallel workers for fast norm-stats parquet reading "
                              f"(default: auto = min(cpu_count, 64), currently {_default_workers})")
-    parser.add_argument("--norm_stats_max_frames", type=int, default=10000,
-                        help="Limit frames sampled for norm-stats slow-path fallback "
-                             "(default: auto-cap at 200,000 when dataset > 500,000 frames). "
-                             "The fast parquet path always reads all frames regardless.")
+    parser.add_argument("--norm_stats_max_frames", type=int, default=0,
+                        help="Fast-path frame cap. 0 (default) reads every state/action row. "
+                             "A positive value samples about that many frames from a seeded file subset. "
+                             "Slow-path fallback still auto-caps very large datasets at 200,000 frames.")
     return parser.parse_args()
 
 
@@ -306,9 +343,13 @@ def analyze_features(info: dict) -> dict:
 
 @dataclasses.dataclass(frozen=True)
 class GenericLeRobotInputs:
-    """Map any LeRobot schema to the three-image format expected by OpenPI models."""
+    """Map dataset image keys onto OpenPI's three camera slots.
 
-    image_keys: tuple
+    ``camera_slots`` is ``(slot_name, dataset_key)`` pairs. Slots that are
+    absent are zeros with ``image_mask=False``.
+    """
+
+    camera_slots: tuple
     state_key: str
     action_key: str = "action"
 
@@ -323,13 +364,15 @@ class GenericLeRobotInputs:
 
     def __call__(self, data: dict) -> dict:
         model_keys = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+        slot_to_key = dict(self.camera_slots)
         images: dict[str, np.ndarray] = {}
         image_masks: dict[str, np.bool_] = {}
         ref_shape = None
 
-        for i, mkey in enumerate(model_keys):
-            if i < len(self.image_keys) and self.image_keys[i] in data:
-                img = self._parse_image(data[self.image_keys[i]])
+        for mkey in model_keys:
+            dataset_key = slot_to_key.get(mkey)
+            if dataset_key is not None and dataset_key in data:
+                img = self._parse_image(data[dataset_key])
                 images[mkey] = img
                 image_masks[mkey] = np.True_
                 if ref_shape is None:
@@ -371,6 +414,33 @@ class GenericLeRobotOutputs:
 # Normalization statistics
 # ---------------------------------------------------------------------------
 
+def _rows_per_parquet(path: pathlib.Path, column: str) -> int:
+    import pyarrow.parquet as pq
+
+    try:
+        return int(pq.read_table(path, columns=[column]).num_rows)
+    except Exception:
+        return 0
+
+
+def select_parquet_files(
+    files: list[pathlib.Path],
+    max_frames: int | None,
+    rows_per_file: int,
+    seed: int = 0,
+) -> list[pathlib.Path]:
+    """Return every file when ``max_frames`` is unset, else a seeded subset."""
+    ordered = list(files)
+    if max_frames is None or max_frames <= 0 or rows_per_file <= 0 or not ordered:
+        return ordered
+    n_files = max(1, max_frames // max(1, rows_per_file) + 1)
+    if n_files >= len(ordered):
+        return ordered
+    rng = random.Random(seed)
+    rng.shuffle(ordered)
+    return ordered[:n_files]
+
+
 def _compute_norm_stats_fast(
     config,
     dataset_dir: pathlib.Path,
@@ -385,12 +455,12 @@ def _compute_norm_stats_fast(
 
     RunningStats.update() reshapes input to (-1, last_dim), so per-frame parquet data
     [N, feat_dim] produces statistically equivalent results to the full pipeline's
-    [N, action_horizon, feat_dim] batches.
+    [N, action_horizon, feat_dim] batches. ``max_frames is None`` reads every row.
+    A positive cap samples a seeded subset of files.
 
     Returns True on success, False if the fast path cannot be used.
     """
     import concurrent.futures
-    import random
 
     import pyarrow.parquet as pq
     import openpi.shared.normalize as normalize
@@ -420,16 +490,13 @@ def _compute_norm_stats_fast(
         logger.warning(f"Failed to read parquet schema: {e}; skipping fast norm-stats path.")
         return False
 
-    files_to_process: list[pathlib.Path] = list(parquet_files)
-    if max_frames is not None:
-        # Estimate average frames per file from first file, then take a random subset
-        try:
-            n_sample = pq.read_table(parquet_files[0], columns=[state_col]).num_rows
-            n_files_needed = max(1, max_frames // max(1, n_sample) + 1)
-        except Exception:
-            n_files_needed = len(files_to_process)
-        random.shuffle(files_to_process)
-        files_to_process = files_to_process[:n_files_needed]
+    files_to_process = list(parquet_files)
+    if max_frames is not None and max_frames > 0:
+        files_to_process = select_parquet_files(
+            files_to_process,
+            max_frames,
+            _rows_per_parquet(parquet_files[0], state_col),
+        )
 
     logger.info(
         f"Fast norm-stats: {len(files_to_process)}/{len(parquet_files)} parquet files, "
@@ -613,6 +680,94 @@ def compute_norm_stats(
 # Main
 # ---------------------------------------------------------------------------
 
+def _cache_dir_for(args, dataset_dir: pathlib.Path, info: dict) -> pathlib.Path:
+    if args.convert_dir is not None:
+        return pathlib.Path(args.convert_dir)
+    stamp = conversion_stamp(dataset_dir, video_keys_from_info(info), 1000)
+    digest = hashlib.sha256(
+        json.dumps(stamp, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return pathlib.Path(args.output_dir) / ".v21_cache" / digest
+
+
+def prepare_dataset(args) -> dict:
+    """Resolve the on-disk tree training should read, including camera filters."""
+    dataset_dir = pathlib.Path(args.dataset_dir)
+    output_dir = pathlib.Path(args.output_dir)
+    if not (dataset_dir / "meta" / "info.json").is_file():
+        raise FileNotFoundError(
+            f"No LeRobot dataset at {dataset_dir}. "
+            "Expected meta/info.json. Mount with -v /path/to/dataset:/data/input"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    info = discover_dataset(dataset_dir)
+    raw_images = analyze_features(info)["image_keys"]
+    selected = select_image_keys(
+        raw_images,
+        cameras=_csv_list(args.cameras),
+        drop_cameras=_csv_list(args.drop_cameras),
+    )
+    dropped = [key for key in raw_images if key not in selected]
+    cache_dir = _cache_dir_for(args, dataset_dir, info)
+    version = str(info.get("codebase_version", ""))
+    logger.info(f"Dataset codebase_version : {version or 'unknown'}")
+    logger.info(f"Image built for LeRobot  : {os.environ.get('LEROBOT_DATASET_VERSION') or 'auto'}")
+
+    if version.startswith("v3") or version.startswith("3"):
+        logger.info("Detected v3.0 dataset – converting to v2.1 layout for compatibility …")
+        full_dir = convert_v3_to_v2(dataset_dir, cache_dir)
+        logger.info(f"Converted dataset version: {discover_dataset(full_dir).get('codebase_version')}")
+    else:
+        full_dir = stage_writable_dataset(dataset_dir, cache_dir / "writable")
+
+    full_videos = set(video_keys_from_info(discover_dataset(full_dir)))
+    if set(selected) != full_videos:
+        effective_dir = make_camera_view(full_dir, camera_view_dir(cache_dir, selected), selected)
+    else:
+        effective_dir = full_dir
+
+    info = discover_dataset(effective_dir)
+    if str(info.get("codebase_version", "")).lower().startswith("v2"):
+        ensure_v21_episodes_stats(effective_dir, info)
+    normalize_parquet_hf_metadata(effective_dir)
+
+    schema = analyze_features(info)
+    slots = assign_camera_slots(schema["image_keys"], parse_camera_map(args.camera_map))
+    has_task_text = bool(schema["has_tasks"] and tasks_have_text(effective_dir))
+    task_texts = [str(row["task"]) for row in load_tasks(effective_dir)] if has_task_text else []
+    logger.info(f"  image keys : {schema['image_keys']}")
+    logger.info(f"  dropped    : {dropped or 'none'}")
+    logger.info(f"  camera slots: {slots}")
+    logger.info(f"  state      : {schema['state_key']}  dim={schema['state_dim']}")
+    logger.info(f"  action     : {schema['action_key']}  dim={schema['action_dim']}")
+    logger.info(f"  has tasks  : {schema['has_tasks']}  task text: {task_texts or has_task_text}")
+    return {
+        "dataset_dir": dataset_dir,
+        "output_dir": output_dir,
+        "effective_dir": effective_dir,
+        "schema": schema,
+        "slots": slots,
+        "dropped": dropped,
+        "has_task_text": has_task_text,
+        "task_texts": task_texts,
+    }
+
+
+def write_run_manifest(path: pathlib.Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def copy_manifest_into_steps(checkpoint_dir: pathlib.Path) -> None:
+    manifest = checkpoint_dir / "run_manifest.json"
+    if not manifest.is_file():
+        return
+    for child in checkpoint_dir.iterdir():
+        if child.is_dir() and child.name.isdigit():
+            shutil.copyfile(manifest, child / "run_manifest.json")
+
+
 def main():
     args = parse_args()
 
@@ -622,42 +777,17 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # ---- validate dataset mount ----
-    if not DATASET_DIR.exists():
-        logger.error(
-            "Dataset not found at /data/input. "
-            "Mount your dataset: docker run -v /path/to/dataset:/data/input …"
-        )
+    try:
+        prepared = prepare_dataset(args)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("%s", exc)
         sys.exit(1)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ---- discover dataset ----
-    info = discover_dataset(DATASET_DIR)
-    dataset_version = info.get("codebase_version", "unknown")
-    expected_version = os.environ.get("LEROBOT_DATASET_VERSION", "")
-    logger.info(f"Dataset codebase_version : {dataset_version}")
-    logger.info(f"Image built for LeRobot  : {expected_version or 'auto'}")
-
-    # ---- v3 -> v2 conversion if needed ----
-    effective_dir = DATASET_DIR
-    if dataset_version.startswith("v3") or dataset_version.startswith("3"):
-        logger.info("Detected v3.0 dataset – converting to v2.1 layout for compatibility …")
-        effective_dir = convert_v3_to_v2(DATASET_DIR)
-        info = discover_dataset(effective_dir)
-        logger.info(f"Converted dataset version: {info.get('codebase_version', 'unknown')}")
-
-    effective_version = str(info.get("codebase_version", "")).lower()
-    if effective_version.startswith("v2"):
-        ensure_v21_episodes_stats(effective_dir, info)
-    normalize_parquet_hf_metadata(effective_dir)
-
-    schema = analyze_features(info)
-    has_task_text = bool(schema["has_tasks"] and tasks_have_text(effective_dir))
-    logger.info(f"  image keys : {schema['image_keys']}")
-    logger.info(f"  state      : {schema['state_key']}  dim={schema['state_dim']}")
-    logger.info(f"  action     : {schema['action_key']}  dim={schema['action_dim']}")
-    logger.info(f"  has tasks  : {schema['has_tasks']}  task text: {has_task_text}")
+    output_dir = prepared["output_dir"]
+    effective_dir = prepared["effective_dir"]
+    schema = prepared["schema"]
+    slots = prepared["slots"]
+    has_task_text = prepared["has_task_text"]
 
     # ---- link dataset into LeRobot cache ----
     repo_id = setup_dataset_link(effective_dir)
@@ -765,11 +895,24 @@ def main():
 
     # ---- transforms ----
     generic_inputs = GenericLeRobotInputs(
-        image_keys=tuple(schema["image_keys"]),
+        camera_slots=tuple(slots.items()),
         state_key=schema["state_key"],
         action_key=schema["action_key"],
     )
     generic_outputs = GenericLeRobotOutputs(action_dim=schema["action_dim"])
+    input_transforms = [generic_inputs]
+    output_transforms = [generic_outputs]
+    action_mode = "absolute"
+    delta_mask: tuple | None = None
+    if args.delta_joint_actions:
+        if schema["action_dim"] < 1:
+            logger.error("delta_joint_actions requires a positive action dimension")
+            sys.exit(1)
+        delta_mask = _transforms.make_bool_mask(max(schema["action_dim"] - 1, 0), -1)
+        input_transforms.append(_transforms.DeltaActions(delta_mask))
+        output_transforms = [_transforms.AbsoluteActions(delta_mask), *output_transforms]
+        action_mode = "delta_joints"
+        logger.info(f"delta joint actions enabled, mask={delta_mask}")
 
     default_prompt = args.prompt or os.environ.get("DEFAULT_PROMPT", "perform the task")
 
@@ -777,8 +920,8 @@ def main():
         repo_id=repo_id,
         assets=_config.AssetsConfig(asset_id="training_dataset"),
         data_transforms=lambda _mc: _transforms.Group(
-            inputs=[generic_inputs],
-            outputs=[generic_outputs],
+            inputs=input_transforms,
+            outputs=output_transforms,
         ),
         model_transforms=_config.ModelTransformFactory(
             default_prompt=None if has_task_text else default_prompt,
@@ -798,19 +941,21 @@ def main():
     )
 
     # ---- assemble TrainConfig ----
+    peak_lr = args.learning_rate or 2.5e-5
     config = _config.TrainConfig(
-        name="docker_train",
+        name=args.run_name,
         model=model_config,
         data=data_factory,
         weight_loader=weight_loaders.CheckpointWeightLoader(weight_path),
         batch_size=args.batch_size,
         num_train_steps=args.steps,
-        checkpoint_base_dir=str(OUTPUT_DIR),
+        checkpoint_base_dir=str(output_dir),
         assets_base_dir="/workspace/assets",
-        exp_name="train",
+        exp_name=args.exp_name,
         overwrite=True,
         wandb_enabled=False,
         save_interval=args.save_interval,
+        keep_period=5000,
         lr_schedule=lr_schedule,
         num_workers=args.num_workers,
         fsdp_devices=fsdp_devices,
@@ -822,19 +967,51 @@ def main():
     logger.info(f"checkpoint_dir = {config.checkpoint_dir}")
     logger.info(f"weight source  = {weight_path}")
 
+    norm_max_frames = args.norm_stats_max_frames if args.norm_stats_max_frames > 0 else None
+    manifest = {
+        "model_type": model_type,
+        "lora": use_lora,
+        "weight_path": weight_path,
+        "openpi_git_ref": os.environ.get("OPENPI_GIT_REF", ""),
+        "run_name": args.run_name,
+        "exp_name": args.exp_name,
+        "cameras": list(schema["image_keys"]),
+        "camera_slots": slots,
+        "dropped_cameras": prepared["dropped"],
+        "prompt_from_task": has_task_text,
+        "task_texts": prepared["task_texts"],
+        "default_prompt": None if has_task_text else default_prompt,
+        "action_horizon": args.action_horizon,
+        "action_mode": action_mode,
+        "delta_mask": list(delta_mask) if delta_mask is not None else None,
+        "batch_size": args.batch_size,
+        "steps": args.steps,
+        "learning_rate": peak_lr,
+        "save_interval": args.save_interval,
+        "norm_stats_max_frames": args.norm_stats_max_frames,
+        "dataset_dir": str(prepared["dataset_dir"]),
+        "effective_dataset_dir": str(effective_dir),
+    }
+    # Keep the manifest beside the checkpoint directory. Training with
+    # overwrite=True deletes checkpoint_dir itself before the first step.
+    manifest_sidecar = config.checkpoint_dir.parent / f"{config.checkpoint_dir.name}.run_manifest.json"
+    write_run_manifest(manifest_sidecar, manifest)
+
     # ---- step 1: normalization statistics ----
     compute_norm_stats(
         config,
         dataset_dir=effective_dir,
         schema=schema,
-        max_frames=args.norm_stats_max_frames,
+        max_frames=norm_max_frames,
         num_workers=args.norm_stats_workers,
     )
 
     # ---- step 2: train ----
     logger.info("Starting training …")
     train_main(config)
-    logger.info(f"Training complete.  Checkpoints → {OUTPUT_DIR}")
+    write_run_manifest(config.checkpoint_dir / "run_manifest.json", manifest)
+    copy_manifest_into_steps(config.checkpoint_dir)
+    logger.info(f"Training complete.  Checkpoints → {config.checkpoint_dir}")
 
 
 if __name__ == "__main__":
