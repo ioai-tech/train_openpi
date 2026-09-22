@@ -70,6 +70,8 @@ docker run --rm --gpus all --ipc=host \
 | `--gpus` | `all` | or `0,1` |
 | `--prompt` | | used only when the dataset has no task text |
 | `--save_interval` | `500` | |
+| `--keep_period` | `--save_interval` | steps divisible by this are never pruned; `0` keeps only the newest |
+| `--resume` | off | continue from the newest checkpoint in the run directory |
 | `--learning_rate` | `2.5e-5` | |
 | `--fsdp_devices` | `auto` | GPU count when >= 2 |
 | `--lora` | `auto` | `true` / `false` |

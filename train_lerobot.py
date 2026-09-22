@@ -66,6 +66,20 @@ def _csv_list(value: str | None) -> list[str] | None:
     return items or None
 
 
+def resolve_keep_period(save_interval: int, keep_period: int | None) -> int | None:
+    """Pick ``keep_period`` so a run keeps the checkpoints it writes.
+
+    OpenPI runs the checkpoint manager with ``max_to_keep=1``, so anything not
+    covered by ``keep_period`` is deleted when the next checkpoint lands. A
+    ``keep_period`` of 0 means "keep only the newest".
+    """
+    if keep_period is None:
+        return save_interval or None
+    if keep_period <= 0:
+        return None
+    return keep_period
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OpenPI on a mounted LeRobot dataset")
     parser.add_argument("--dataset_dir", type=pathlib.Path, default=DEFAULT_DATASET_DIR,
@@ -94,6 +108,13 @@ def parse_args():
     parser.add_argument("--prompt", type=str, default=None,
                         help="Default language prompt when dataset has no tasks")
     parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument("--keep_period", type=int, default=None,
+                        help="Checkpoints at steps divisible by this are never pruned. "
+                             "Default keeps every saved checkpoint (same as --save_interval); "
+                             "0 keeps only the most recent one.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue from the newest checkpoint in "
+                             "<output_dir>/<run_name>/<exp_name> instead of starting over")
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--fsdp_devices", type=str, default="auto",
                         help="FSDP device count: 'auto' (=GPU count when >=2), or integer")
@@ -942,6 +963,7 @@ def main():
 
     # ---- assemble TrainConfig ----
     peak_lr = args.learning_rate or 2.5e-5
+    keep_period = resolve_keep_period(args.save_interval, args.keep_period)
     config = _config.TrainConfig(
         name=args.run_name,
         model=model_config,
@@ -952,10 +974,11 @@ def main():
         checkpoint_base_dir=str(output_dir),
         assets_base_dir="/workspace/assets",
         exp_name=args.exp_name,
-        overwrite=True,
+        overwrite=not args.resume,
+        resume=args.resume,
         wandb_enabled=False,
         save_interval=args.save_interval,
-        keep_period=5000,
+        keep_period=keep_period,
         lr_schedule=lr_schedule,
         num_workers=args.num_workers,
         fsdp_devices=fsdp_devices,
@@ -966,6 +989,7 @@ def main():
     logger.info(f"batch_size={args.batch_size}  steps={args.steps}")
     logger.info(f"checkpoint_dir = {config.checkpoint_dir}")
     logger.info(f"weight source  = {weight_path}")
+    logger.info(f"save_interval  = {args.save_interval}  keep_period = {keep_period}  resume = {args.resume}")
 
     norm_max_frames = args.norm_stats_max_frames if args.norm_stats_max_frames > 0 else None
     manifest = {
@@ -988,6 +1012,8 @@ def main():
         "steps": args.steps,
         "learning_rate": peak_lr,
         "save_interval": args.save_interval,
+        "keep_period": keep_period,
+        "resume": args.resume,
         "norm_stats_max_frames": args.norm_stats_max_frames,
         "dataset_dir": str(prepared["dataset_dir"]),
         "effective_dataset_dir": str(effective_dir),

@@ -69,6 +69,8 @@ docker run --rm --gpus all --ipc=host \
 | `--gpus` | `all` | 或 `0,1` |
 | `--prompt` | | 仅当数据集没有 task 文本时使用 |
 | `--save_interval` | `500` | |
+| `--keep_period` | 等于 `--save_interval` | 步数能被它整除的 checkpoint 不会被清理；`0` 表示只保留最新一个 |
+| `--resume` | 关闭 | 从 run 目录里最新的 checkpoint 继续 |
 | `--learning_rate` | `2.5e-5` | |
 | `--fsdp_devices` | `auto` | GPU >= 2 时等于卡数 |
 | `--lora` | `auto` | `true` / `false` |
