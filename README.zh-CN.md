@@ -85,7 +85,8 @@ docker run --rm --gpus all --ipc=host \
 | `--cameras` | 全部图像键 | 逗号分隔，只保留这些键 |
 | `--drop_cameras` | | 键名或子串，例如 `front` |
 | `--camera_map` | 按名字角色 | `base=键,left_wrist=键,right_wrist=键` |
-| `--delta_joint_actions` | 关闭 | 关节用增量，最后一维（夹爪）保持绝对 |
+| `--delta_joint_actions` | 关闭 | 关节用增量；不传下一参数时仍只有最后一维保持绝对 |
+| `--absolute_action_dims` | | 与 `--delta_joint_actions` 一起用。逗号分隔的下标或动作名保持绝对，并替换「只保留最后一维」的默认，例如 `right_gripper,left_gripper` |
 | `--norm_stats_workers` | `min(cpu, 64)` | |
 | `--norm_stats_max_frames` | `0` | `0` 表示读完全部状态/动作 |
 

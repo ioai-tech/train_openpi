@@ -28,8 +28,11 @@ from lerobot_v3_compat import generate_episodes_stats_from_parquet
 from lerobot_v3_compat import load_sanitized_stats_json
 from lerobot_v3_compat import load_tasks
 from lerobot_v3_compat import make_camera_view
+from lerobot_v3_compat import repair_episode_timestamps
+from lerobot_v3_compat import rewrite_episode_timestamps
 from lerobot_v3_compat import sanitize_episode_stats
 from lerobot_v3_compat import select_image_keys
+from lerobot_v3_compat import timestamps_within_tolerance
 from lerobot_v3_compat import stage_writable_dataset
 from lerobot_v3_compat import stats_from_episode_record
 from lerobot_v3_compat import tasks_have_text
@@ -633,6 +636,52 @@ def test_extract_video_segment_starts_at_zero(tmp_path: Path) -> None:
     ).splitlines()[0]
     assert float(start.strip()) < 1e-3
     assert abs(float(first.split(",")[0])) < 1e-3
+
+
+def test_long_float32_episode_timestamps_are_rewritten() -> None:
+    fps = 30.0
+    length = 40_000
+    coarse = (np.arange(length, dtype=np.float64) / fps).astype(np.float32)
+    assert not timestamps_within_tolerance(coarse, fps)
+    table = pa.table({"timestamp": pa.array(coarse, type=pa.float32())})
+    updated = rewrite_episode_timestamps(table, fps)
+    values = np.asarray(updated.column("timestamp").to_pylist(), dtype=np.float64)
+    assert timestamps_within_tolerance(values, fps)
+    assert values[0] == 0.0
+    assert abs(values[1] - (1.0 / fps)) < 1e-12
+
+    short = pa.table({"timestamp": pa.array(np.array([0.0, 1.0 / fps], dtype=np.float64))})
+    assert rewrite_episode_timestamps(short, fps) is short
+
+
+def test_repair_episode_timestamps_rewrites_only_bad_files(tmp_path: Path) -> None:
+    fps = 30.0
+    data = tmp_path / "data" / "chunk-000"
+    data.mkdir(parents=True)
+    good = np.arange(4, dtype=np.float64) / fps
+    bad = (np.arange(40_000, dtype=np.float64) / fps).astype(np.float32)
+    pq.write_table(pa.table({"timestamp": good}), data / "episode_000000.parquet")
+    pq.write_table(pa.table({"timestamp": pa.array(bad, type=pa.float32())}), data / "episode_000001.parquet")
+    assert repair_episode_timestamps(tmp_path, fps) == 1
+    kept = pq.read_table(data / "episode_000000.parquet").column("timestamp").to_pylist()
+    assert np.allclose(kept, good)
+    fixed = np.asarray(
+        pq.read_table(data / "episode_000001.parquet").column("timestamp").to_pylist(),
+        dtype=np.float64,
+    )
+    assert timestamps_within_tolerance(fixed, fps)
+    assert repair_episode_timestamps(tmp_path, fps) == 0
+
+
+def test_too_many_cameras_names_the_unmapped_key() -> None:
+    keys = [
+        "observation.images.camera_high",
+        "observation.images.camera_low",
+        "observation.images.camera_left_wrist",
+        "observation.images.camera_right_wrist",
+    ]
+    with pytest.raises(ValueError, match="camera_low"):
+        select_image_keys(keys)
 
 
 def test_camera_slots_follow_role_names() -> None:

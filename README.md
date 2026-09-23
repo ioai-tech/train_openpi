@@ -86,7 +86,8 @@ docker run --rm --gpus all --ipc=host \
 | `--cameras` | all image keys | comma-separated keys to keep |
 | `--drop_cameras` | | key or substring, e.g. `front` |
 | `--camera_map` | role-based | `base=key,left_wrist=key,right_wrist=key` |
-| `--delta_joint_actions` | off | joint deltas, last dim (gripper) stays absolute |
+| `--delta_joint_actions` | off | joint deltas; only the last dim stays absolute |
+| `--absolute_action_dims` | | with `--delta_joint_actions`, indices or action names that stay absolute. Replaces the last-dim default, e.g. `right_gripper,left_gripper` |
 | `--norm_stats_workers` | `min(cpu, 64)` | |
 | `--norm_stats_max_frames` | `0` | `0` reads every state/action row |
 

@@ -613,11 +613,75 @@ def convert_info(
     return v2_info
 
 
+# LeRobotDataset rejects a step that misses 1/fps by more than this.
+TIMESTAMP_TOLERANCE_S = 1e-4
+
+
+def timestamps_within_tolerance(
+    values: np.ndarray,
+    fps: float,
+    tolerance_s: float = TIMESTAMP_TOLERANCE_S,
+) -> bool:
+    """True when consecutive timestamps match ``1/fps`` inside ``tolerance_s``."""
+    series = np.asarray(values, dtype=np.float64).reshape(-1)
+    if series.size < 2:
+        return True
+    if fps <= 0:
+        return False
+    return bool(np.all(np.abs(np.diff(series) - (1.0 / float(fps))) <= tolerance_s))
+
+
+def rewrite_episode_timestamps(table: pa.Table, fps: float) -> pa.Table:
+    """Replace timestamps that float32 can no longer space at ``1/fps``.
+
+    A multi-hour episode stored as float32 drifts by more than LeRobot's
+    ``1e-4`` s once the clock is large. ``i / fps`` in float64 stays exact.
+    Episodes that already pass are returned unchanged.
+    """
+    if "timestamp" not in table.column_names or fps <= 0:
+        return table
+    current = np.asarray(table.column("timestamp").to_pylist(), dtype=np.float64).reshape(-1)
+    if timestamps_within_tolerance(current, fps):
+        return table
+    fresh = np.arange(table.num_rows, dtype=np.float64) / float(fps)
+    index = table.schema.get_field_index("timestamp")
+    return table.set_column(index, "timestamp", pa.array(fresh, type=pa.float64()))
+
+
+def repair_episode_timestamps(dataset_dir: Path, fps: float) -> int:
+    """Rewrite episode parquet files whose timestamps miss LeRobot's tolerance.
+
+    Returns the number of files changed. Safe to repeat.
+    """
+    data_root = Path(dataset_dir) / "data"
+    if fps <= 0 or not data_root.is_dir():
+        return 0
+    rewritten = 0
+    for path in sorted(data_root.glob("**/*.parquet")):
+        table = pq.read_table(path)
+        updated = rewrite_episode_timestamps(table, fps)
+        if updated is table:
+            continue
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        pq.write_table(updated, tmp_path)
+        os.replace(tmp_path, path)
+        rewritten += 1
+    if rewritten:
+        logger.info(
+            "Rewrote timestamps in %s episode file(s) at %s so steps stay within %.1e s of 1/fps",
+            rewritten,
+            dataset_dir,
+            TIMESTAMP_TOLERANCE_S,
+        )
+    return rewritten
+
+
 def convert_data(
     src: Path,
     dest: Path,
     episode_records: list[dict[str, Any]],
     chunks_size: int,
+    fps: float | None = None,
 ) -> None:
     grouped = _group_episodes_by_data_file(episode_records)
     for (chunk_idx, file_idx), records in grouped.items():
@@ -651,6 +715,9 @@ def convert_data(
                 episode_table = table.filter(pc.equal(table.column("episode_index"), episode_index))
                 if episode_table.num_rows <= 0:
                     raise ValueError(f"No rows for episode_index={episode_index} in {source_path}")
+
+            if fps is not None and fps > 0:
+                episode_table = rewrite_episode_timestamps(episode_table, fps)
 
             dest_path = dest / v2_data_relpath(episode_index, chunks_size)
             dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1178,8 +1245,10 @@ def select_image_keys(
     if not selected:
         raise ValueError(f"No image keys left after camera selection. Available: {available}")
     if len(selected) > len(MODEL_IMAGE_SLOTS):
+        unmapped = [key for key in selected if _preferred_slot(key) is None]
+        detail = f" Keys without a base/wrist role: {unmapped}." if unmapped else ""
         raise ValueError(
-            f"OpenPI has {len(MODEL_IMAGE_SLOTS)} image slots, got {selected}. "
+            f"OpenPI has {len(MODEL_IMAGE_SLOTS)} image slots, got {selected}.{detail} "
             "Pass --cameras or --drop_cameras to choose at most 3."
         )
     return selected
@@ -1309,7 +1378,7 @@ def convert_v3_to_v2(
         write_v21_stats_json(meta_dest / "stats.json", global_stats)
 
     _write_jsonl(meta_dest / "tasks.jsonl", tasks)
-    convert_data(src, dest, episode_records, chunks_size)
+    convert_data(src, dest, episode_records, chunks_size, fps=float(info.get("fps") or 0))
     convert_videos(
         src,
         dest,
