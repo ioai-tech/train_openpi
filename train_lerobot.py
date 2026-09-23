@@ -10,10 +10,12 @@ No modifications to OpenPI core code are required.
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import os
 import pathlib
+import random
 import shutil
 import sys
 
@@ -33,13 +35,23 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import numpy as np
 
+from lerobot_v3_compat import assign_camera_slots
+from lerobot_v3_compat import camera_view_dir
+from lerobot_v3_compat import conversion_stamp
 from lerobot_v3_compat import convert_v3_to_v2
 from lerobot_v3_compat import episodes_stats_compatible_with_v21
 from lerobot_v3_compat import generate_episodes_stats_from_parquet
+from lerobot_v3_compat import load_tasks
+from lerobot_v3_compat import make_camera_view
+from lerobot_v3_compat import parse_camera_map
+from lerobot_v3_compat import repair_episode_timestamps
+from lerobot_v3_compat import select_image_keys
+from lerobot_v3_compat import stage_writable_dataset
 from lerobot_v3_compat import tasks_have_text
+from lerobot_v3_compat import video_keys_from_info
 
-DATASET_DIR = pathlib.Path("/data/input")
-OUTPUT_DIR = pathlib.Path("/data/output")
+DEFAULT_DATASET_DIR = pathlib.Path(os.environ.get("OPENPI_DATASET_DIR", "/data/input"))
+DEFAULT_OUTPUT_DIR = pathlib.Path(os.environ.get("OPENPI_OUTPUT_DIR", "/data/output"))
 
 logger = logging.getLogger("train_lerobot")
 
@@ -48,8 +60,52 @@ logger = logging.getLogger("train_lerobot")
 # CLI
 # ---------------------------------------------------------------------------
 
+def _csv_list(value: str | None) -> list[str] | None:
+    if value is None or not value.strip():
+        return None
+    items = [part.strip() for part in value.split(",") if part.strip()]
+    return items or None
+
+
+def resolve_keep_period(save_interval: int, keep_period: int | None) -> int | None:
+    """Pick ``keep_period`` so a run keeps the checkpoints it writes.
+
+    OpenPI runs the checkpoint manager with ``max_to_keep=1``, so anything not
+    covered by ``keep_period`` is deleted when the next checkpoint lands. A
+    ``keep_period`` of 0 means "keep only the newest".
+    """
+    if keep_period is None:
+        return save_interval or None
+    if keep_period <= 0:
+        return None
+    return keep_period
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train OpenPI on a mounted LeRobot dataset")
+    parser.add_argument("--dataset_dir", type=pathlib.Path, default=DEFAULT_DATASET_DIR,
+                        help="LeRobot dataset root (default: $OPENPI_DATASET_DIR or /data/input)")
+    parser.add_argument("--output_dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR,
+                        help="Checkpoint root (default: $OPENPI_OUTPUT_DIR or /data/output)")
+    parser.add_argument("--run_name", type=str, default="docker_train",
+                        help="TrainConfig name. Checkpoints land in <output_dir>/<run_name>/<exp_name>")
+    parser.add_argument("--exp_name", type=str, default="train")
+    parser.add_argument("--convert_dir", type=pathlib.Path, default=None,
+                        help="Writable v3->v2 cache. Default: <output_dir>/.v21_cache/<fingerprint>. "
+                             "Do not point this at a small tmpfs.")
+    parser.add_argument("--cameras", type=str, default=None,
+                        help="Comma-separated image keys to keep, e.g. observation.images.top,observation.images.wrist")
+    parser.add_argument("--drop_cameras", type=str, default=None,
+                        help="Comma-separated image keys or substrings to drop, e.g. front")
+    parser.add_argument("--camera_map", type=str, default=None,
+                        help="Explicit slots: base=key,left_wrist=key,right_wrist=key")
+    parser.add_argument("--delta_joint_actions", action="store_true",
+                        help="Train joint dims as deltas and keep the last dim (gripper) absolute. "
+                             "Default keeps the dataset action values unchanged.")
+    parser.add_argument("--absolute_action_dims", type=str, default=None,
+                        help="With --delta_joint_actions, comma-separated indices or action names "
+                             "that stay absolute. Replaces the default of keeping only the last dim. "
+                             "Example: right_gripper,left_gripper or 12,13.")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--gpus", type=str, default="all",
@@ -57,6 +113,13 @@ def parse_args():
     parser.add_argument("--prompt", type=str, default=None,
                         help="Default language prompt when dataset has no tasks")
     parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument("--keep_period", type=int, default=None,
+                        help="Checkpoints at steps divisible by this are never pruned. "
+                             "Default keeps every saved checkpoint (same as --save_interval); "
+                             "0 keeps only the most recent one.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue from the newest checkpoint in "
+                             "<output_dir>/<run_name>/<exp_name> instead of starting over")
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--fsdp_devices", type=str, default="auto",
                         help="FSDP device count: 'auto' (=GPU count when >=2), or integer")
@@ -72,10 +135,10 @@ def parse_args():
     parser.add_argument("--norm_stats_workers", type=int, default=_default_workers,
                         help=f"Parallel workers for fast norm-stats parquet reading "
                              f"(default: auto = min(cpu_count, 64), currently {_default_workers})")
-    parser.add_argument("--norm_stats_max_frames", type=int, default=10000,
-                        help="Limit frames sampled for norm-stats slow-path fallback "
-                             "(default: auto-cap at 200,000 when dataset > 500,000 frames). "
-                             "The fast parquet path always reads all frames regardless.")
+    parser.add_argument("--norm_stats_max_frames", type=int, default=0,
+                        help="Fast-path frame cap. 0 (default) reads every state/action row. "
+                             "A positive value samples about that many frames from a seeded file subset. "
+                             "Slow-path fallback still auto-caps very large datasets at 200,000 frames.")
     return parser.parse_args()
 
 
@@ -263,6 +326,7 @@ def analyze_features(info: dict) -> dict:
     action_key = None
     state_dim = 0
     action_dim = 0
+    action_names = None
     has_tasks = "task_index" in features
 
     for key, feat in features.items():
@@ -281,6 +345,13 @@ def analyze_features(info: dict) -> dict:
         elif key in ("action", "actions") and action_key is None:
             action_key = key
             action_dim = shape[-1] if shape else 0
+            raw_names = feat.get("names")
+            if (
+                isinstance(raw_names, list)
+                and len(raw_names) == action_dim
+                and all(isinstance(name, str) for name in raw_names)
+            ):
+                action_names = list(raw_names)
 
     if not image_keys:
         raise ValueError("No image features found in the dataset")
@@ -295,6 +366,7 @@ def analyze_features(info: dict) -> dict:
         action_key=action_key,
         state_dim=state_dim,
         action_dim=action_dim,
+        action_names=action_names,
         has_tasks=has_tasks,
         fps=info.get("fps", 50),
     )
@@ -306,9 +378,13 @@ def analyze_features(info: dict) -> dict:
 
 @dataclasses.dataclass(frozen=True)
 class GenericLeRobotInputs:
-    """Map any LeRobot schema to the three-image format expected by OpenPI models."""
+    """Map dataset image keys onto OpenPI's three camera slots.
 
-    image_keys: tuple
+    ``camera_slots`` is ``(slot_name, dataset_key)`` pairs. Slots that are
+    absent are zeros with ``image_mask=False``.
+    """
+
+    camera_slots: tuple
     state_key: str
     action_key: str = "action"
 
@@ -323,13 +399,15 @@ class GenericLeRobotInputs:
 
     def __call__(self, data: dict) -> dict:
         model_keys = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+        slot_to_key = dict(self.camera_slots)
         images: dict[str, np.ndarray] = {}
         image_masks: dict[str, np.bool_] = {}
         ref_shape = None
 
-        for i, mkey in enumerate(model_keys):
-            if i < len(self.image_keys) and self.image_keys[i] in data:
-                img = self._parse_image(data[self.image_keys[i]])
+        for mkey in model_keys:
+            dataset_key = slot_to_key.get(mkey)
+            if dataset_key is not None and dataset_key in data:
+                img = self._parse_image(data[dataset_key])
                 images[mkey] = img
                 image_masks[mkey] = np.True_
                 if ref_shape is None:
@@ -368,8 +446,294 @@ class GenericLeRobotOutputs:
 
 
 # ---------------------------------------------------------------------------
-# Normalization statistics
+# Action deltas and normalization statistics
 # ---------------------------------------------------------------------------
+
+_DEGENERATE_QUANTILE_SPAN = 1e-6
+
+
+def relaxed_timestamp_tolerance(fps: float | None, tolerance_s: float = 1e-4) -> float:
+    """Widen LeRobot's 1e-4 s check just enough for float32 clocks.
+
+    ``torch.tensor`` casts timestamps to float32 before the check. Past a few
+    thousand seconds the float32 step no longer matches ``1/fps`` within 1e-4,
+    so a multi-hour episode is rejected even when every frame is present.
+    Half a frame is still stricter than a dropped frame, whose error is ``1/fps``.
+    An explicit tolerance above 1e-4 is left alone.
+    """
+    if fps is None or fps <= 0 or tolerance_s > 1e-4:
+        return tolerance_s
+    return max(tolerance_s, 0.5 / float(fps))
+
+
+def relax_lerobot_timestamp_tolerance() -> None:
+    """Teach the pinned LeRobot to accept float32 timestamp rounding."""
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+
+    if getattr(lerobot_dataset.LeRobotDataset.__init__, "_openpi_relaxed_tolerance", False):
+        return
+    original = lerobot_dataset.LeRobotDataset.__init__
+
+    def _init(self, repo_id, root=None, *args, tolerance_s: float = 1e-4, **kwargs):
+        info_root = pathlib.Path(root) if root is not None else (
+            pathlib.Path(os.environ.get("HF_LEROBOT_HOME", pathlib.Path.home() / ".cache" / "lerobot"))
+            / str(repo_id)
+        )
+        fps = None
+        info_path = info_root / "meta" / "info.json"
+        if info_path.is_file():
+            try:
+                fps = float(json.loads(info_path.read_text(encoding="utf-8")).get("fps") or 0)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                fps = None
+        tolerance_s = relaxed_timestamp_tolerance(fps, tolerance_s)
+        return original(self, repo_id, root=root, *args, tolerance_s=tolerance_s, **kwargs)
+
+    _init._openpi_relaxed_tolerance = True
+    lerobot_dataset.LeRobotDataset.__init__ = _init
+
+
+def require_delta_for_absolute_dims(delta_joint_actions: bool, absolute_action_dims: str | None) -> None:
+    if absolute_action_dims and absolute_action_dims.strip() and not delta_joint_actions:
+        raise ValueError("--absolute_action_dims requires --delta_joint_actions")
+
+
+def resolve_delta_mask(
+    action_dim: int,
+    absolute_action_dims: str | None,
+    action_names: list[str] | None,
+) -> tuple[bool, ...]:
+    """Mask for ``DeltaActions``. True means delta, False means absolute.
+
+    Omitting ``absolute_action_dims`` keeps only the last dimension absolute.
+    A provided list replaces that default instead of adding to it.
+    """
+    if action_dim < 1:
+        raise ValueError("delta_joint_actions requires a positive action dimension")
+    if absolute_action_dims is None or not absolute_action_dims.strip():
+        mask = [True] * action_dim
+        mask[-1] = False
+        return tuple(mask)
+
+    names = list(action_names or [])
+    absolute: set[int] = set()
+    for token in absolute_action_dims.split(","):
+        item = token.strip()
+        if not item:
+            continue
+        if item.lstrip("-").isdigit():
+            index = int(item)
+            if index < 0:
+                index += action_dim
+            if not 0 <= index < action_dim:
+                raise ValueError(f"absolute action index {item} is outside 0..{action_dim - 1}")
+            absolute.add(index)
+            continue
+        matches = [index for index, name in enumerate(names) if name == item]
+        if not matches:
+            raise ValueError(f"Unknown action dim {item!r}. Names: {names or 'none'}")
+        absolute.update(matches)
+    if not absolute:
+        raise ValueError("--absolute_action_dims did not select any dimension")
+    return tuple(index not in absolute for index in range(action_dim))
+
+
+def delta_action_chunks(
+    state: np.ndarray,
+    actions: np.ndarray,
+    delta_mask: tuple[bool, ...] | list[bool],
+    horizon: int,
+) -> np.ndarray:
+    """Chunk-relative deltas for one episode, clamped at the last frame.
+
+    ``state`` and ``actions`` are ``(T, D)`` in time order. Masked dimensions of
+    each ``actions[t:t+horizon]`` subtract ``state[t]``. Past the episode, the
+    last frame is repeated, which is how LeRobot builds an action chunk.
+    """
+    state = np.asarray(state, dtype=np.float32)
+    actions = np.asarray(actions, dtype=np.float32)
+    if state.ndim != 2 or actions.shape != state.shape:
+        raise ValueError(
+            f"state and actions must share shape (T, D), got {state.shape} and {actions.shape}"
+        )
+    length, dim = actions.shape
+    if length < 1:
+        raise ValueError("episode has no frames")
+    if horizon < 1:
+        raise ValueError("action horizon must be positive")
+    mask = np.asarray(list(delta_mask), dtype=bool)
+    if mask.shape != (dim,):
+        raise ValueError(f"delta mask length {mask.shape[0]} != action dim {dim}")
+    offsets = np.arange(length)[:, None] + np.arange(horizon)[None, :]
+    np.minimum(offsets, length - 1, out=offsets)
+    chunks = np.array(actions[offsets], dtype=np.float32, copy=True)
+    if bool(mask.any()):
+        chunks[:, :, mask] -= state[:, None, mask]
+    return chunks
+
+
+def widen_degenerate_quantile_bounds(mean, q01, q99, min_span: float = _DEGENERATE_QUANTILE_SPAN):
+    """Widen only dimensions whose quantile span is below ``min_span``.
+
+    Unchanged dimensions keep their original values. When nothing is degenerate
+    the original ``q01`` and ``q99`` objects are returned.
+    """
+    mean_arr = np.asarray(mean, dtype=np.float64)
+    q01_arr = np.asarray(q01, dtype=np.float64)
+    q99_arr = np.asarray(q99, dtype=np.float64)
+    if mean_arr.shape != q01_arr.shape or q01_arr.shape != q99_arr.shape:
+        raise ValueError("mean, q01, and q99 must share a shape")
+    degenerate = (q99_arr - q01_arr) < min_span
+    if not np.any(degenerate):
+        return q01, q99
+    q01_out = np.array(q01_arr, copy=True)
+    q99_out = np.array(q99_arr, copy=True)
+    q01_out[degenerate] = mean_arr[degenerate] - 0.5
+    q99_out[degenerate] = mean_arr[degenerate] + 0.5
+    return q01_out, q99_out
+
+
+def stabilize_norm_stats(norm_stats: dict) -> dict:
+    """Leave mean and std alone. Widen constant quantile bounds before saving."""
+    updated = {}
+    for key, stats in norm_stats.items():
+        q01 = getattr(stats, "q01", None)
+        q99 = getattr(stats, "q99", None)
+        if q01 is None or q99 is None:
+            updated[key] = stats
+            continue
+        new_q01, new_q99 = widen_degenerate_quantile_bounds(stats.mean, q01, q99)
+        if new_q01 is q01 and new_q99 is q99:
+            updated[key] = stats
+            continue
+        updated[key] = dataclasses.replace(stats, q01=new_q01, q99=new_q99)
+    return updated
+
+
+def newest_checkpoint_norm_stats(checkpoint_dir: pathlib.Path, asset_id: str) -> pathlib.Path | None:
+    """``norm_stats.json`` from the highest numbered checkpoint step, if present."""
+    checkpoint_dir = pathlib.Path(checkpoint_dir)
+    if not checkpoint_dir.is_dir():
+        return None
+    found: list[tuple[int, pathlib.Path]] = []
+    for child in checkpoint_dir.iterdir():
+        if not child.is_dir() or not child.name.isdigit():
+            continue
+        stats = child / "assets" / asset_id / "norm_stats.json"
+        if stats.is_file():
+            found.append((int(child.name), stats))
+    if not found:
+        return None
+    found.sort()
+    return found[-1][1]
+
+
+def install_resume_norm_stats(
+    checkpoint_dir: pathlib.Path,
+    assets_dir: pathlib.Path,
+    asset_id: str,
+) -> pathlib.Path | None:
+    """Copy saved norm stats so a resumed run keeps the scale it already trained with."""
+    source = newest_checkpoint_norm_stats(checkpoint_dir, asset_id)
+    if source is None:
+        return None
+    dest_dir = pathlib.Path(assets_dir) / asset_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "norm_stats.json"
+    shutil.copy2(source, dest)
+    return dest
+
+
+def _rows_per_parquet(path: pathlib.Path, column: str) -> int:
+    import pyarrow.parquet as pq
+
+    try:
+        return int(pq.read_table(path, columns=[column]).num_rows)
+    except Exception:
+        return 0
+
+
+def select_parquet_files(
+    files: list[pathlib.Path],
+    max_frames: int | None,
+    rows_per_file: int,
+    seed: int = 0,
+) -> list[pathlib.Path]:
+    """Return every file when ``max_frames`` is unset, else a seeded subset."""
+    ordered = list(files)
+    if max_frames is None or max_frames <= 0 or rows_per_file <= 0 or not ordered:
+        return ordered
+    n_files = max(1, max_frames // max(1, rows_per_file) + 1)
+    if n_files >= len(ordered):
+        return ordered
+    rng = random.Random(seed)
+    rng.shuffle(ordered)
+    return ordered[:n_files]
+
+
+def _consume_in_order(futures):
+    """Yield future results in submission order.
+
+    ``RunningStats`` is order-sensitive twice over: its mean is a running
+    average, and its quantiles come from a histogram whose grid is anchored on
+    the first batch it sees. Folding results in completion order therefore made
+    the statistics depend on thread timing, so two runs over identical data
+    could bake slightly different norm stats into their checkpoints.
+    """
+    for future in futures:
+        yield future.result()
+
+
+def _fold_absolute_rows(state_stats, action_stats, rows) -> int:
+    """Update stats once per file, in file order. That anchors quantile bins."""
+    total = 0
+    for state_arr, action_arr, _episode, _frame in rows:
+        if state_arr is None or len(state_arr) == 0:
+            continue
+        state_stats.update(state_arr)
+        action_stats.update(action_arr)
+        total += len(state_arr)
+    return total
+
+
+def _fold_delta_rows(state_stats, action_stats, rows, delta_mask, action_horizon: int) -> int:
+    """Update action stats with chunk deltas, episodes in index order."""
+    states = []
+    actions = []
+    episodes = []
+    frames = []
+    for state_arr, action_arr, episode, frame in rows:
+        if state_arr is None or len(state_arr) == 0:
+            continue
+        if episode is None or frame is None:
+            raise ValueError("delta norm stats require episode_index and frame_index")
+        states.append(np.asarray(state_arr, dtype=np.float32))
+        actions.append(np.asarray(action_arr, dtype=np.float32))
+        episodes.append(np.asarray(episode, dtype=np.int64).reshape(-1))
+        frames.append(np.asarray(frame, dtype=np.int64).reshape(-1))
+    if not states:
+        return 0
+    state = np.concatenate(states, axis=0)
+    action = np.concatenate(actions, axis=0)
+    episode = np.concatenate(episodes, axis=0)
+    frame = np.concatenate(frames, axis=0)
+    if not (len(state) == len(action) == len(episode) == len(frame)):
+        raise ValueError("state, action, episode_index, and frame_index row counts disagree")
+    order = np.lexsort((frame, episode))
+    state = state[order]
+    action = action[order]
+    episode = episode[order]
+    boundaries = np.flatnonzero(np.diff(episode)) + 1
+    total = 0
+    for index in np.split(np.arange(len(episode)), boundaries):
+        if len(index) == 0:
+            continue
+        chunks = delta_action_chunks(state[index], action[index], delta_mask, action_horizon)
+        action_stats.update(chunks)
+        state_stats.update(state[index])
+        total += len(index)
+    return total
+
 
 def _compute_norm_stats_fast(
     config,
@@ -377,6 +741,8 @@ def _compute_norm_stats_fast(
     schema: dict,
     max_frames: int | None,
     num_workers: int,
+    delta_mask: tuple[bool, ...] | None = None,
+    action_horizon: int = 50,
 ) -> bool:
     """Compute norm-stats by reading state/action columns directly from parquet files.
 
@@ -385,12 +751,16 @@ def _compute_norm_stats_fast(
 
     RunningStats.update() reshapes input to (-1, last_dim), so per-frame parquet data
     [N, feat_dim] produces statistically equivalent results to the full pipeline's
-    [N, action_horizon, feat_dim] batches.
+    [N, action_horizon, feat_dim] batches when actions are left absolute.
+    ``max_frames is None`` reads every row. A positive cap samples a seeded subset of files.
+
+    When ``delta_mask`` is set, action stats are computed on the same chunk deltas the
+    training transforms produce. Missing episode columns fail this path instead of
+    saving absolute-action statistics.
 
     Returns True on success, False if the fast path cannot be used.
     """
     import concurrent.futures
-    import random
 
     import pyarrow.parquet as pq
     import openpi.shared.normalize as normalize
@@ -410,9 +780,13 @@ def _compute_norm_stats_fast(
     try:
         sample_schema = pq.read_schema(parquet_files[0])
         available = sample_schema.names
-        if state_col not in available or action_col not in available:
+        required = [state_col, action_col]
+        if delta_mask is not None:
+            required.extend(["episode_index", "frame_index"])
+        missing = [name for name in required if name not in available]
+        if missing:
             logger.warning(
-                f"Parquet columns '{state_col}' or '{action_col}' not found "
+                f"Parquet columns {missing} not found "
                 f"(available: {available}); skipping fast norm-stats path."
             )
             return False
@@ -420,16 +794,13 @@ def _compute_norm_stats_fast(
         logger.warning(f"Failed to read parquet schema: {e}; skipping fast norm-stats path.")
         return False
 
-    files_to_process: list[pathlib.Path] = list(parquet_files)
-    if max_frames is not None:
-        # Estimate average frames per file from first file, then take a random subset
-        try:
-            n_sample = pq.read_table(parquet_files[0], columns=[state_col]).num_rows
-            n_files_needed = max(1, max_frames // max(1, n_sample) + 1)
-        except Exception:
-            n_files_needed = len(files_to_process)
-        random.shuffle(files_to_process)
-        files_to_process = files_to_process[:n_files_needed]
+    files_to_process = list(parquet_files)
+    if max_frames is not None and max_frames > 0:
+        files_to_process = select_parquet_files(
+            files_to_process,
+            max_frames,
+            _rows_per_parquet(parquet_files[0], state_col),
+        )
 
     logger.info(
         f"Fast norm-stats: {len(files_to_process)}/{len(parquet_files)} parquet files, "
@@ -437,53 +808,54 @@ def _compute_norm_stats_fast(
         + (f", max_frames={max_frames}" if max_frames else "")
     )
 
+    read_columns = [state_col, action_col]
+    if delta_mask is not None:
+        read_columns.extend(["episode_index", "frame_index"])
+
     def _read_file(pq_path: pathlib.Path):
         try:
-            table = pq.read_table(pq_path, columns=[state_col, action_col])
-            state_arr = np.array(table.column(state_col).to_pylist(), dtype=np.float32)
-            action_arr = np.array(table.column(action_col).to_pylist(), dtype=np.float32)
-            return state_arr, action_arr
+            table = pq.read_table(pq_path, columns=read_columns)
+            state_arr = np.asarray(table.column(state_col).to_pylist(), dtype=np.float32)
+            action_arr = np.asarray(table.column(action_col).to_pylist(), dtype=np.float32)
+            if delta_mask is None:
+                return state_arr, action_arr, None, None
+            episode = np.asarray(table.column("episode_index").to_pylist(), dtype=np.int64)
+            frame = np.asarray(table.column("frame_index").to_pylist(), dtype=np.int64)
+            return state_arr, action_arr, episode, frame
         except Exception as e:
             logger.warning(f"Skipping {pq_path.name}: {e}")
-            return None, None
+            return None, None, None, None
 
     state_stats = normalize.RunningStats()
     action_stats = normalize.RunningStats()
-    total_frames = 0
+    loaded = []
 
     if num_workers > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
             future_list = [pool.submit(_read_file, p) for p in files_to_process]
-            pbar = tqdm(
-                concurrent.futures.as_completed(future_list),
+            loaded = list(tqdm(
+                _consume_in_order(future_list),
                 total=len(future_list),
                 desc="norm-stats (fast)",
-            )
-            for fut in pbar:
-                state_arr, action_arr = fut.result()
-                if state_arr is None:
-                    continue
-                state_stats.update(state_arr)
-                action_stats.update(action_arr)
-                total_frames += len(state_arr)
-                pbar.set_postfix(frames=total_frames)
+            ))
     else:
-        for pq_path in tqdm(files_to_process, desc="norm-stats (fast)"):
-            state_arr, action_arr = _read_file(pq_path)
-            if state_arr is None:
-                continue
-            state_stats.update(state_arr)
-            action_stats.update(action_arr)
-            total_frames += len(state_arr)
+        loaded = [_read_file(pq_path) for pq_path in tqdm(files_to_process, desc="norm-stats (fast)")]
+
+    if delta_mask is None:
+        total_frames = _fold_absolute_rows(state_stats, action_stats, loaded)
+    else:
+        total_frames = _fold_delta_rows(
+            state_stats, action_stats, loaded, delta_mask, action_horizon
+        )
 
     if state_stats._count < 2 or action_stats._count < 2:
         logger.warning("Not enough frames for fast norm-stats; will fall back to slow path.")
         return False
 
-    norm_stats = {
+    norm_stats = stabilize_norm_stats({
         "state": state_stats.get_statistics(),
         "actions": action_stats.get_statistics(),
-    }
+    })
 
     data_config = config.data.create(config.assets_dirs, config.model)
     out = config.assets_dirs / data_config.asset_id
@@ -498,6 +870,8 @@ def compute_norm_stats(
     schema: dict,
     max_frames: int | None = None,
     num_workers: int = 0,
+    delta_mask: tuple[bool, ...] | None = None,
+    action_horizon: int = 50,
 ) -> None:
     """Compute and save normalization stats if they don't already exist.
 
@@ -521,7 +895,13 @@ def compute_norm_stats(
     # --- Fast path: direct parquet reads (skips video decoding entirely) ---
     try:
         success = _compute_norm_stats_fast(
-            config, dataset_dir, schema, max_frames, num_workers
+            config,
+            dataset_dir,
+            schema,
+            max_frames,
+            num_workers,
+            delta_mask=delta_mask,
+            action_horizon=action_horizon,
         )
         if success:
             return
@@ -606,12 +986,121 @@ def compute_norm_stats(
 
     out = config.assets_dirs / data_config.asset_id
     logger.info(f"Saving norm stats → {out}")
-    normalize.save(out, norm_stats)
+    normalize.save(out, stabilize_norm_stats(norm_stats))
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def enable_line_buffered_stdout() -> None:
+    """Flush progress lines as they are written.
+
+    Per-step metrics are emitted with ``tqdm.write``, which does not flush.
+    When stdout is a pipe (`docker logs`, a redirected log file) Python
+    block-buffers it, so ``Step N: loss=...`` can stay invisible for thousands
+    of steps. Progress bars are unaffected because they go through logging.
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _cache_dir_for(args, dataset_dir: pathlib.Path, info: dict) -> pathlib.Path:
+    if args.convert_dir is not None:
+        return pathlib.Path(args.convert_dir)
+    stamp = conversion_stamp(dataset_dir, video_keys_from_info(info), 1000)
+    digest = hashlib.sha256(
+        json.dumps(stamp, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return pathlib.Path(args.output_dir) / ".v21_cache" / digest
+
+
+def prepare_dataset(args) -> dict:
+    """Resolve the on-disk tree training should read, including camera filters."""
+    dataset_dir = pathlib.Path(args.dataset_dir)
+    output_dir = pathlib.Path(args.output_dir)
+    if not (dataset_dir / "meta" / "info.json").is_file():
+        raise FileNotFoundError(
+            f"No LeRobot dataset at {dataset_dir}. "
+            "Expected meta/info.json. Mount with -v /path/to/dataset:/data/input"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    info = discover_dataset(dataset_dir)
+    raw_images = analyze_features(info)["image_keys"]
+    selected = select_image_keys(
+        raw_images,
+        cameras=_csv_list(args.cameras),
+        drop_cameras=_csv_list(args.drop_cameras),
+    )
+    dropped = [key for key in raw_images if key not in selected]
+    cache_dir = _cache_dir_for(args, dataset_dir, info)
+    version = str(info.get("codebase_version", ""))
+    logger.info(f"Dataset codebase_version : {version or 'unknown'}")
+    logger.info(f"Image built for LeRobot  : {os.environ.get('LEROBOT_DATASET_VERSION') or 'auto'}")
+
+    if version.startswith("v3") or version.startswith("3"):
+        logger.info("Detected v3.0 dataset – converting to v2.1 layout for compatibility …")
+        full_dir = convert_v3_to_v2(dataset_dir, cache_dir)
+        logger.info(f"Converted dataset version: {discover_dataset(full_dir).get('codebase_version')}")
+    else:
+        full_dir = stage_writable_dataset(dataset_dir, cache_dir / "writable")
+
+    dataset_fps = float(discover_dataset(full_dir).get("fps") or 0)
+    if dataset_fps > 0:
+        repair_episode_timestamps(full_dir, dataset_fps)
+
+    full_videos = set(video_keys_from_info(discover_dataset(full_dir)))
+    if set(selected) != full_videos:
+        effective_dir = make_camera_view(full_dir, camera_view_dir(cache_dir, selected), selected)
+    else:
+        effective_dir = full_dir
+
+    info = discover_dataset(effective_dir)
+    if str(info.get("codebase_version", "")).lower().startswith("v2"):
+        ensure_v21_episodes_stats(effective_dir, info)
+    normalize_parquet_hf_metadata(effective_dir)
+
+    schema = analyze_features(info)
+    slots = assign_camera_slots(schema["image_keys"], parse_camera_map(args.camera_map))
+    has_task_text = bool(schema["has_tasks"] and tasks_have_text(effective_dir))
+    task_texts = [str(row["task"]) for row in load_tasks(effective_dir)] if has_task_text else []
+    logger.info(f"  image keys : {schema['image_keys']}")
+    logger.info(f"  dropped    : {dropped or 'none'}")
+    logger.info(f"  camera slots: {slots}")
+    logger.info(f"  state      : {schema['state_key']}  dim={schema['state_dim']}")
+    logger.info(
+        f"  action     : {schema['action_key']}  dim={schema['action_dim']}"
+        f"  names={schema.get('action_names')}"
+    )
+    logger.info(f"  has tasks  : {schema['has_tasks']}  task text: {task_texts or has_task_text}")
+    return {
+        "dataset_dir": dataset_dir,
+        "output_dir": output_dir,
+        "effective_dir": effective_dir,
+        "schema": schema,
+        "slots": slots,
+        "dropped": dropped,
+        "has_task_text": has_task_text,
+        "task_texts": task_texts,
+    }
+
+
+def write_run_manifest(path: pathlib.Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def copy_manifest_into_steps(checkpoint_dir: pathlib.Path) -> None:
+    manifest = checkpoint_dir / "run_manifest.json"
+    if not manifest.is_file():
+        return
+    for child in checkpoint_dir.iterdir():
+        if child.is_dir() and child.name.isdigit():
+            shutil.copyfile(manifest, child / "run_manifest.json")
+
 
 def main():
     args = parse_args()
@@ -621,43 +1110,19 @@ def main():
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    enable_line_buffered_stdout()
 
-    # ---- validate dataset mount ----
-    if not DATASET_DIR.exists():
-        logger.error(
-            "Dataset not found at /data/input. "
-            "Mount your dataset: docker run -v /path/to/dataset:/data/input …"
-        )
+    try:
+        prepared = prepare_dataset(args)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("%s", exc)
         sys.exit(1)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ---- discover dataset ----
-    info = discover_dataset(DATASET_DIR)
-    dataset_version = info.get("codebase_version", "unknown")
-    expected_version = os.environ.get("LEROBOT_DATASET_VERSION", "")
-    logger.info(f"Dataset codebase_version : {dataset_version}")
-    logger.info(f"Image built for LeRobot  : {expected_version or 'auto'}")
-
-    # ---- v3 -> v2 conversion if needed ----
-    effective_dir = DATASET_DIR
-    if dataset_version.startswith("v3") or dataset_version.startswith("3"):
-        logger.info("Detected v3.0 dataset – converting to v2.1 layout for compatibility …")
-        effective_dir = convert_v3_to_v2(DATASET_DIR)
-        info = discover_dataset(effective_dir)
-        logger.info(f"Converted dataset version: {info.get('codebase_version', 'unknown')}")
-
-    effective_version = str(info.get("codebase_version", "")).lower()
-    if effective_version.startswith("v2"):
-        ensure_v21_episodes_stats(effective_dir, info)
-    normalize_parquet_hf_metadata(effective_dir)
-
-    schema = analyze_features(info)
-    has_task_text = bool(schema["has_tasks"] and tasks_have_text(effective_dir))
-    logger.info(f"  image keys : {schema['image_keys']}")
-    logger.info(f"  state      : {schema['state_key']}  dim={schema['state_dim']}")
-    logger.info(f"  action     : {schema['action_key']}  dim={schema['action_dim']}")
-    logger.info(f"  has tasks  : {schema['has_tasks']}  task text: {has_task_text}")
+    output_dir = prepared["output_dir"]
+    effective_dir = prepared["effective_dir"]
+    schema = prepared["schema"]
+    slots = prepared["slots"]
+    has_task_text = prepared["has_task_text"]
 
     # ---- link dataset into LeRobot cache ----
     repo_id = setup_dataset_link(effective_dir)
@@ -668,6 +1133,7 @@ def main():
         logger.info(f"CUDA_VISIBLE_DEVICES = {args.gpus}")
 
     # ---- delayed heavy imports ----
+    relax_lerobot_timestamp_tolerance()
     import jax
     import flax.nnx as nnx
     import openpi.models.pi0_config as pi0_config
@@ -765,11 +1231,31 @@ def main():
 
     # ---- transforms ----
     generic_inputs = GenericLeRobotInputs(
-        image_keys=tuple(schema["image_keys"]),
+        camera_slots=tuple(slots.items()),
         state_key=schema["state_key"],
         action_key=schema["action_key"],
     )
     generic_outputs = GenericLeRobotOutputs(action_dim=schema["action_dim"])
+    input_transforms = [generic_inputs]
+    output_transforms = [generic_outputs]
+    action_mode = "absolute"
+    delta_mask: tuple | None = None
+    try:
+        require_delta_for_absolute_dims(args.delta_joint_actions, args.absolute_action_dims)
+        if args.delta_joint_actions:
+            delta_mask = resolve_delta_mask(
+                schema["action_dim"],
+                args.absolute_action_dims,
+                schema.get("action_names"),
+            )
+    except ValueError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+    if delta_mask is not None:
+        input_transforms.append(_transforms.DeltaActions(delta_mask))
+        output_transforms = [_transforms.AbsoluteActions(delta_mask), *output_transforms]
+        action_mode = "delta_joints"
+        logger.info(f"delta joint actions enabled, mask={delta_mask}")
 
     default_prompt = args.prompt or os.environ.get("DEFAULT_PROMPT", "perform the task")
 
@@ -777,8 +1263,8 @@ def main():
         repo_id=repo_id,
         assets=_config.AssetsConfig(asset_id="training_dataset"),
         data_transforms=lambda _mc: _transforms.Group(
-            inputs=[generic_inputs],
-            outputs=[generic_outputs],
+            inputs=input_transforms,
+            outputs=output_transforms,
         ),
         model_transforms=_config.ModelTransformFactory(
             default_prompt=None if has_task_text else default_prompt,
@@ -798,19 +1284,23 @@ def main():
     )
 
     # ---- assemble TrainConfig ----
+    peak_lr = args.learning_rate or 2.5e-5
+    keep_period = resolve_keep_period(args.save_interval, args.keep_period)
     config = _config.TrainConfig(
-        name="docker_train",
+        name=args.run_name,
         model=model_config,
         data=data_factory,
         weight_loader=weight_loaders.CheckpointWeightLoader(weight_path),
         batch_size=args.batch_size,
         num_train_steps=args.steps,
-        checkpoint_base_dir=str(OUTPUT_DIR),
+        checkpoint_base_dir=str(output_dir),
         assets_base_dir="/workspace/assets",
-        exp_name="train",
-        overwrite=True,
+        exp_name=args.exp_name,
+        overwrite=not args.resume,
+        resume=args.resume,
         wandb_enabled=False,
         save_interval=args.save_interval,
+        keep_period=keep_period,
         lr_schedule=lr_schedule,
         num_workers=args.num_workers,
         fsdp_devices=fsdp_devices,
@@ -821,20 +1311,65 @@ def main():
     logger.info(f"batch_size={args.batch_size}  steps={args.steps}")
     logger.info(f"checkpoint_dir = {config.checkpoint_dir}")
     logger.info(f"weight source  = {weight_path}")
+    logger.info(f"save_interval  = {args.save_interval}  keep_period = {keep_period}  resume = {args.resume}")
+
+    norm_max_frames = args.norm_stats_max_frames if args.norm_stats_max_frames > 0 else None
+    manifest = {
+        "model_type": model_type,
+        "lora": use_lora,
+        "weight_path": weight_path,
+        "openpi_git_ref": os.environ.get("OPENPI_GIT_REF", ""),
+        "run_name": args.run_name,
+        "exp_name": args.exp_name,
+        "cameras": list(schema["image_keys"]),
+        "camera_slots": slots,
+        "dropped_cameras": prepared["dropped"],
+        "prompt_from_task": has_task_text,
+        "task_texts": prepared["task_texts"],
+        "default_prompt": None if has_task_text else default_prompt,
+        "action_horizon": args.action_horizon,
+        "action_mode": action_mode,
+        "absolute_action_dims": args.absolute_action_dims,
+        "delta_mask": list(delta_mask) if delta_mask is not None else None,
+        "batch_size": args.batch_size,
+        "steps": args.steps,
+        "learning_rate": peak_lr,
+        "save_interval": args.save_interval,
+        "keep_period": keep_period,
+        "resume": args.resume,
+        "norm_stats_max_frames": args.norm_stats_max_frames,
+        "dataset_dir": str(prepared["dataset_dir"]),
+        "effective_dataset_dir": str(effective_dir),
+    }
+    # Keep the manifest beside the checkpoint directory. Training with
+    # overwrite=True deletes checkpoint_dir itself before the first step.
+    manifest_sidecar = config.checkpoint_dir.parent / f"{config.checkpoint_dir.name}.run_manifest.json"
+    write_run_manifest(manifest_sidecar, manifest)
 
     # ---- step 1: normalization statistics ----
+    asset_id = "training_dataset"
+    if args.resume:
+        restored = install_resume_norm_stats(config.checkpoint_dir, config.assets_dirs, asset_id)
+        if restored is not None:
+            logger.info("Reusing checkpoint norm stats at %s", restored)
+        else:
+            logger.info("Resume requested but no checkpoint norm stats were found; recomputing")
     compute_norm_stats(
         config,
         dataset_dir=effective_dir,
         schema=schema,
-        max_frames=args.norm_stats_max_frames,
+        max_frames=norm_max_frames,
         num_workers=args.norm_stats_workers,
+        delta_mask=delta_mask,
+        action_horizon=args.action_horizon,
     )
 
     # ---- step 2: train ----
     logger.info("Starting training …")
     train_main(config)
-    logger.info(f"Training complete.  Checkpoints → {OUTPUT_DIR}")
+    write_run_manifest(config.checkpoint_dir / "run_manifest.json", manifest)
+    copy_manifest_into_steps(config.checkpoint_dir)
+    logger.info(f"Training complete.  Checkpoints → {config.checkpoint_dir}")
 
 
 if __name__ == "__main__":

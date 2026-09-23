@@ -9,7 +9,7 @@ on:
       - entrypoint.sh
       - train_lerobot.py
       - lerobot_v3_compat.py
-      - test_lerobot_v3_compat.py
+      - test_*.py
       - requirements-test.txt
       - .dockerignore
       - .github/workflows/docker.yml
@@ -19,7 +19,7 @@ on:
       - entrypoint.sh
       - train_lerobot.py
       - lerobot_v3_compat.py
-      - test_lerobot_v3_compat.py
+      - test_*.py
       - requirements-test.txt
       - .dockerignore
       - .github/workflows/docker.yml

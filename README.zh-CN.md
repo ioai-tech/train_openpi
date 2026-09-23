@@ -69,14 +69,26 @@ docker run --rm --gpus all --ipc=host \
 | `--gpus` | `all` | 或 `0,1` |
 | `--prompt` | | 仅当数据集没有 task 文本时使用 |
 | `--save_interval` | `500` | |
+| `--keep_period` | 等于 `--save_interval` | 步数能被它整除的 checkpoint 不会被清理；`0` 表示只保留最新一个 |
+| `--resume` | 关闭 | 从 run 目录里最新的 checkpoint 继续 |
 | `--learning_rate` | `2.5e-5` | |
 | `--fsdp_devices` | `auto` | GPU >= 2 时等于卡数 |
 | `--lora` | `auto` | `true` / `false` |
 | `--ema_decay` | 关闭 | 例如 `0.99` |
 | `--action_horizon` | `50` | |
 | `--num_workers` | `8` | |
+| `--dataset_dir` | `/data/input` | 或 `$OPENPI_DATASET_DIR` |
+| `--output_dir` | `/data/output` | 或 `$OPENPI_OUTPUT_DIR` |
+| `--run_name` | `docker_train` | checkpoint 的上一级目录 |
+| `--exp_name` | `train` | |
+| `--convert_dir` | 在 `--output_dir` 下 | v3→v2 缓存，不要放在小的 tmpfs 上 |
+| `--cameras` | 全部图像键 | 逗号分隔，只保留这些键 |
+| `--drop_cameras` | | 键名或子串，例如 `front` |
+| `--camera_map` | 按名字角色 | `base=键,left_wrist=键,right_wrist=键` |
+| `--delta_joint_actions` | 关闭 | 关节用增量；不传下一参数时仍只有最后一维保持绝对 |
+| `--absolute_action_dims` | | 与 `--delta_joint_actions` 一起用。逗号分隔的下标或动作名保持绝对，并替换「只保留最后一维」的默认，例如 `right_gripper,left_gripper` |
 | `--norm_stats_workers` | `min(cpu, 64)` | |
-| `--norm_stats_max_frames` | `10000` | |
+| `--norm_stats_max_frames` | `0` | `0` 表示读完全部状态/动作 |
 
 ## LoRA
 
@@ -84,6 +96,54 @@ docker run --rm --gpus all --ipc=host \
 >22.5GB 显存，可在 24GB 机器（如 RTX 4090）上跑；全量微调约需 >70GB。
 
 单卡默认开启。关闭：`--lora false`。
+
+## 摄像头
+
+Pi0 / Pi0.5 固定三个槽位：`base_0_rgb`、`left_wrist_0_rgb`、`right_wrist_0_rgb`。
+键名里的 `front` / `base` / `high` / `exterior` 进 base，`wrist` 进左手腕，
+同时含 `right` 和 `wrist` 进右手腕。剩下的键按这个顺序填空槽。没有分到的槽位
+是全零图像，并且 `image_mask=false`。
+
+最多使用三个摄像头。数据集更多时用 `--cameras` 或 `--drop_cameras`。下面先训
+三个摄像头，再用同一份缓存去掉 front：
+
+```bash
+docker run --rm --gpus all --shm-size=16g \
+  -v /path/to/lerobot_dataset:/data/input:ro \
+  -v /path/to/output:/data/output \
+  -v /path/to/cache:/data/cache \
+  ioaitech/train_openpi:pi05-cuda126 \
+  --run_name pi05_my_task_3cam \
+  --steps 30000 \
+  --save_interval 5000 \
+  --convert_dir /data/cache/my_task
+
+docker run --rm --gpus all --shm-size=16g \
+  -v /path/to/lerobot_dataset:/data/input:ro \
+  -v /path/to/output:/data/output \
+  -v /path/to/cache:/data/cache \
+  ioaitech/train_openpi:pi05-cuda126 \
+  --run_name pi05_my_task_no_front \
+  --drop_cameras front \
+  --steps 30000 \
+  --save_interval 5000 \
+  --convert_dir /data/cache/my_task
+```
+
+v3 数据集只会在 `--convert_dir` 里转换一次。同一目录、同一组视频再次运行会直接
+复用。去掉部分摄像头时，会在旁边做一个符号链接目录，并改写 `meta/info.json`，
+LeRobot 就不会去解码被丢掉的摄像头。缓存要放在真实磁盘上，转换器不会再写到 `/tmp`。
+
+缓存和相机视图都是自包含的：它们之间的链接是相对路径，在容器外也能解析。整段
+等于某个源视频的 episode 用硬链接，源与缓存是不同挂载点时就退化为复制，因此没有
+任何文件指回数据集挂载点。
+
+只读挂载的数据不会被改写。无法写入的 v2 数据会先在缓存里做一个可写视图，再修补
+元数据。每次运行还会在 `<run_name>/<exp_name>.run_manifest.json` 记下相机映射、
+任务文本，以及动作是否保持绝对量。
+
+镜像入口会在宿主机驱动比镜像里的 CUDA compat 库更新时改用宿主机的 `libcuda`。
+较新的数据中心卡和工作站卡（包括 compute capability 12.0）属于这种情况。
 
 ## 许可证
 

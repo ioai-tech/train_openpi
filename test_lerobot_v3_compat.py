@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pyarrow as pa
@@ -12,16 +15,25 @@ import pytest
 import numpy as np
 
 from lerobot_v3_compat import DatasetLayoutError
+from lerobot_v3_compat import _link_or_copy_whole_file
 from lerobot_v3_compat import _numeric_feature_names
 from lerobot_v3_compat import assert_v2_local_files
 from lerobot_v3_compat import assert_v21_episode_stats_rows
+from lerobot_v3_compat import assign_camera_slots
 from lerobot_v3_compat import convert_v3_to_v2
+from lerobot_v3_compat import extract_video_segment
 from lerobot_v3_compat import episodes_stats_compatible_with_v21
 from lerobot_v3_compat import expected_v2_paths
 from lerobot_v3_compat import generate_episodes_stats_from_parquet
 from lerobot_v3_compat import load_sanitized_stats_json
 from lerobot_v3_compat import load_tasks
+from lerobot_v3_compat import make_camera_view
+from lerobot_v3_compat import repair_episode_timestamps
+from lerobot_v3_compat import rewrite_episode_timestamps
 from lerobot_v3_compat import sanitize_episode_stats
+from lerobot_v3_compat import select_image_keys
+from lerobot_v3_compat import timestamps_within_tolerance
+from lerobot_v3_compat import stage_writable_dataset
 from lerobot_v3_compat import stats_from_episode_record
 from lerobot_v3_compat import tasks_have_text
 from lerobot_v3_compat import unflatten_dict
@@ -193,6 +205,8 @@ def test_load_tasks_index_level_column(tmp_path: Path) -> None:
     )
     tasks = load_tasks(tmp_path)
     assert tasks == [{"task_index": 3, "task": "open the drawer"}]
+    assert tasks_have_text(tmp_path)
+    assert not tasks_have_text(tmp_path / "empty")
 
 
 def test_convert_packed_v3_writes_v2_chunks(tmp_path: Path) -> None:
@@ -230,13 +244,19 @@ def test_convert_packed_v3_writes_v2_chunks(tmp_path: Path) -> None:
     cam_a_ep1 = (dest / "videos" / "chunk-000" / CAM_A / "episode_000001.mp4").read_bytes()
     assert cam_a_ep0 == b"file-000.mp4:0.000:1.000"
     assert cam_a_ep1 == b"file-000.mp4:1.000:2.000"
+    # A whole-file episode is published as a real file, never a symlink: the source
+    # dataset and the cache are separate trees, so no relative link exists and an
+    # absolute one would only work under the mount layout that created it.
     cam_a_ep2 = dest / "videos" / "chunk-001" / CAM_A / "episode_000002.mp4"
-    assert cam_a_ep2.is_symlink()
-    assert cam_a_ep2.resolve().name == "file-001.mp4"
+    assert cam_a_ep2.is_file()
+    assert not cam_a_ep2.is_symlink()
+    assert cam_a_ep2.read_bytes() == (src / "videos" / CAM_A / "chunk-000" / "file-001.mp4").read_bytes()
 
     # cam_b file_index is independent of the single data parquet (always file-000).
-    assert (dest / "videos" / "chunk-000" / CAM_B / "episode_000001.mp4").is_symlink()
-    assert (dest / "videos" / "chunk-000" / CAM_B / "episode_000001.mp4").resolve().name == "file-001.mp4"
+    cam_b_ep1 = dest / "videos" / "chunk-000" / CAM_B / "episode_000001.mp4"
+    assert cam_b_ep1.is_file()
+    assert not cam_b_ep1.is_symlink()
+    assert cam_b_ep1.read_bytes() == (src / "videos" / CAM_B / "chunk-000" / "file-001.mp4").read_bytes()
 
     tasks = [
         json.loads(line)
@@ -547,3 +567,233 @@ def test_convert_official_v21_from_real_v3_stats_layout(tmp_path: Path) -> None:
     assert first[CAM_B]["count"] == [2]
     assert "observation.base_move" in first
     assert_v21_episode_stats_rows(rows)
+
+
+FRONT = "observation.images.front"
+TOP = "observation.images.top"
+WRIST = "observation.images.wrist"
+
+
+def test_extract_video_segment_starts_at_zero(tmp_path: Path) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg is not installed")
+    src = tmp_path / "src.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=30",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "2",
+            str(src),
+        ],
+        check=True,
+    )
+    dst = tmp_path / "cut.mp4"
+    extract_video_segment(src, dst, 0.4, 1.3)
+    start = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=start_time",
+            "-of",
+            "default=nw=1:nk=1",
+            str(dst),
+        ],
+        text=True,
+    )
+    first = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "csv=p=0",
+            str(dst),
+        ],
+        text=True,
+    ).splitlines()[0]
+    assert float(start.strip()) < 1e-3
+    assert abs(float(first.split(",")[0])) < 1e-3
+
+
+def test_long_float32_episode_timestamps_are_rewritten() -> None:
+    fps = 30.0
+    length = 40_000
+    coarse = (np.arange(length, dtype=np.float64) / fps).astype(np.float32)
+    assert not timestamps_within_tolerance(coarse, fps)
+    table = pa.table({"timestamp": pa.array(coarse, type=pa.float32())})
+    updated = rewrite_episode_timestamps(table, fps)
+    values = np.asarray(updated.column("timestamp").to_pylist(), dtype=np.float64)
+    assert timestamps_within_tolerance(values, fps)
+    assert values[0] == 0.0
+    assert abs(values[1] - (1.0 / fps)) < 1e-12
+
+    short = pa.table({"timestamp": pa.array(np.array([0.0, 1.0 / fps], dtype=np.float64))})
+    assert rewrite_episode_timestamps(short, fps) is short
+
+
+def test_repair_episode_timestamps_rewrites_only_bad_files(tmp_path: Path) -> None:
+    fps = 30.0
+    data = tmp_path / "data" / "chunk-000"
+    data.mkdir(parents=True)
+    good = np.arange(4, dtype=np.float64) / fps
+    bad = (np.arange(40_000, dtype=np.float64) / fps).astype(np.float32)
+    pq.write_table(pa.table({"timestamp": good}), data / "episode_000000.parquet")
+    pq.write_table(pa.table({"timestamp": pa.array(bad, type=pa.float32())}), data / "episode_000001.parquet")
+    assert repair_episode_timestamps(tmp_path, fps) == 1
+    kept = pq.read_table(data / "episode_000000.parquet").column("timestamp").to_pylist()
+    assert np.allclose(kept, good)
+    fixed = np.asarray(
+        pq.read_table(data / "episode_000001.parquet").column("timestamp").to_pylist(),
+        dtype=np.float64,
+    )
+    assert timestamps_within_tolerance(fixed, fps)
+    assert repair_episode_timestamps(tmp_path, fps) == 0
+
+
+def test_too_many_cameras_names_the_unmapped_key() -> None:
+    keys = [
+        "observation.images.camera_high",
+        "observation.images.camera_low",
+        "observation.images.camera_left_wrist",
+        "observation.images.camera_right_wrist",
+    ]
+    with pytest.raises(ValueError, match="camera_low"):
+        select_image_keys(keys)
+
+
+def test_camera_slots_follow_role_names() -> None:
+    three = [FRONT, TOP, WRIST]
+    slots = assign_camera_slots(three)
+    assert slots == {
+        "base_0_rgb": FRONT,
+        "left_wrist_0_rgb": WRIST,
+        "right_wrist_0_rgb": TOP,
+    }
+    kept = select_image_keys(three, drop_cameras=["front"])
+    assert kept == [TOP, WRIST]
+    two = assign_camera_slots(kept)
+    assert two == {"base_0_rgb": TOP, "left_wrist_0_rgb": WRIST}
+    assert "right_wrist_0_rgb" not in two
+
+
+def test_convert_reuses_completed_tree_and_can_limit_cameras(tmp_path: Path) -> None:
+    src = build_packed_v3(tmp_path / "v3")
+    calls = {"n": 0}
+
+    def _counting(src_path: Path, dst: Path, start: float, end: float) -> None:
+        calls["n"] += 1
+        _fake_extract(src_path, dst, start, end)
+
+    dest = convert_v3_to_v2(src, tmp_path / "v2", chunks_size=2, extract_video=_counting)
+    assert calls["n"] > 0
+    seen = calls["n"]
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("cached conversion must not extract video again")
+
+    again = convert_v3_to_v2(src, dest, chunks_size=2, extract_video=_forbidden)
+    assert again == dest
+    assert calls["n"] == seen
+
+    with pytest.raises(ValueError, match="/tmp"):
+        convert_v3_to_v2(src)
+
+    limited = convert_v3_to_v2(
+        src,
+        tmp_path / "wrist-only",
+        chunks_size=2,
+        extract_video=_fake_extract,
+        video_keys=[CAM_B],
+    )
+    info = json.loads((limited / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert CAM_B in info["features"]
+    assert CAM_A not in info["features"]
+    assert not any(path.name.startswith("episode_") and CAM_A in str(path) for path in (limited / "videos").rglob("*"))
+
+
+def test_camera_view_hides_dropped_camera_and_reuses(tmp_path: Path) -> None:
+    src = build_packed_v3(tmp_path / "v3")
+    full = convert_v3_to_v2(src, tmp_path / "v2", chunks_size=2, extract_video=_fake_extract)
+    view = make_camera_view(full, tmp_path / "view", [CAM_B])
+    info = json.loads((view / "meta" / "info.json").read_text(encoding="utf-8"))
+    assert CAM_A not in info["features"]
+    assert CAM_B in info["features"]
+    episode = view / "data" / "chunk-000" / "episode_000000.parquet"
+    assert episode.is_file()
+    assert episode.is_symlink()
+    reused = make_camera_view(full, view, [CAM_B])
+    assert reused == view
+    assert make_camera_view(full, tmp_path / "unused", [CAM_A, CAM_B]) == full
+
+
+def test_view_and_cache_links_are_relative(tmp_path: Path) -> None:
+    """Absolute links would record the container's mount path and dangle outside it."""
+    src = build_packed_v3(tmp_path / "v3")
+    full = convert_v3_to_v2(src, tmp_path / "v2", chunks_size=2, extract_video=_fake_extract)
+    view = make_camera_view(full, tmp_path / "view", [CAM_B])
+
+    for tree in (full, view):
+        links = [p for p in tree.rglob("*") if p.is_symlink()]
+        absolute = [str(p) for p in links if os.path.isabs(os.readlink(p))]
+        assert absolute == [], absolute
+        dangling = [str(p) for p in links if not p.resolve().exists()]
+        assert dangling == [], dangling
+    assert (view / "videos").is_dir()
+    assert list((view / "videos").rglob("*.mp4"))
+
+
+def test_whole_file_video_is_published_without_a_symlink(tmp_path: Path) -> None:
+    """A cross-mount symlink cannot be relative, so whole files are linked or copied."""
+    src = tmp_path / "source.mp4"
+    src.write_bytes(b"video-bytes" * 8)
+    dest = tmp_path / "dest.mp4"
+    outcome = _link_or_copy_whole_file(src, dest)
+    assert outcome in {"hardlink", "copy"}
+    assert not dest.is_symlink()
+    assert dest.read_bytes() == src.read_bytes()
+
+
+def test_stage_writable_dataset_does_not_touch_readonly_source(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    meta = src / "meta"
+    data = src / "data" / "chunk-000"
+    data.mkdir(parents=True)
+    (meta).mkdir(parents=True)
+    (meta / "info.json").write_text("{}\n", encoding="utf-8")
+    _write_table(data / "episode_000000.parquet", pa.table({"action": [[0.0, 1.0]]}))
+    before = (data / "episode_000000.parquet").read_bytes()
+    for path in (src, meta, src / "data", data):
+        path.chmod(0o555)
+    try:
+        staged = stage_writable_dataset(src, tmp_path / "work")
+        assert staged != src
+        (staged / "meta" / "episodes_stats.jsonl").write_text("{}\n", encoding="utf-8")
+        assert not (meta / "episodes_stats.jsonl").exists()
+        assert (data / "episode_000000.parquet").read_bytes() == before
+        assert stage_writable_dataset(src, tmp_path / "work") == staged
+    finally:
+        for path in (data, src / "data", meta, src):
+            path.chmod(0o755)
